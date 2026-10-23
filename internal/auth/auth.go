@@ -82,6 +82,25 @@ func (a *Auth) EpochLocked() uint64 {
 	return a.credEpoch
 }
 
+// KeyID 返回 refresh 去重用的**稳定身份标识**（锁内读 UID，回落 FilePath）。
+// 空串表示两者都没有（测试用匿名 Auth），调用方自行回落指针。
+//
+// 存在的理由：upstream.refreshKey 原先无锁直读 a.UID / a.FilePath，而
+// AdoptCredentials 会在锁内改写这些字段（重新登录），两者并发即是数据竞争
+// （go test -race 实测抓到）。身份字段改为「重登不写」后竞争已消失，但读取侧
+// 仍应走锁内访问器，避免将来任何写入方重新引入同一类问题。
+func (a *Auth) KeyID() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.UID != "" {
+		return a.UID
+	}
+	return a.FilePath
+}
+
 // RefreshSnapshot 一次持锁读出「代次 + 当前 AccessToken + 当前 RefreshToken」。
 //
 // 必须一次读齐：分三次调用（Epoch / AccessTokenValue / RefreshTokenValue）会让
@@ -395,6 +414,7 @@ func Parse(raw []byte) (*Auth, error) {
 				ExpiresAt    int64  `json:"expiresAt"`
 				Domain       string `json:"domain"`
 				Realm        string `json:"realm"`
+				Epoch        uint64 `json:"epoch"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -417,6 +437,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			credEpoch:    n.Auth.Epoch,
 		}
 	} else {
 		var f struct {
@@ -425,6 +446,7 @@ func Parse(raw []byte) (*Auth, error) {
 			ExpiresAt    int64  `json:"expiresAt"`
 			Domain       string `json:"domain"`
 			Realm        string `json:"realm"`
+			Epoch        uint64 `json:"epoch"`
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
@@ -443,6 +465,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			credEpoch:    f.Epoch,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -473,6 +496,13 @@ type credDoc struct {
 	enterpriseID string
 	nickname     string
 	deviceToken  string
+	// epoch 凭证代次（落盘键 auth.epoch）。>0 才写：普通 refresh 写回不带该键，
+	// 存量文件形态不变；只有「整体替换凭据」才写，且写入值与内存 credEpoch 一致。
+	//
+	// 落盘意义（跨进程一致性）：auths/*.json 与 state.json 是两个文件、两次写。
+	// 若凭据换新成功而 state.json 写失败，重启时内存无据可判——代次是唯一能跨重启
+	// 证明「凭证比 state 记录的新」的证据（见 pool.reconcileCredEpochLocked）。
+	epoch uint64
 }
 
 // docLocked 取 a 当前字段快照（仅限**已持 a.mu** 的调用方）。
@@ -487,6 +517,7 @@ func (a *Auth) docLocked() credDoc {
 		enterpriseID: a.EnterpriseID,
 		nickname:     a.Nickname,
 		deviceToken:  a.DeviceToken,
+		epoch:        a.credEpoch,
 	}
 }
 
@@ -511,6 +542,12 @@ func (a *Auth) writeLocked(d credDoc) error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if d.deviceToken != "" {
 		doc["device_token"] = d.deviceToken
+	}
+	// epoch 同理：0 不写，避免所有存量账号的每次 refresh 都给文件新增一个键。
+	if d.epoch > 0 {
+		if authObj, ok := doc["auth"].(map[string]any); ok {
+			authObj["epoch"] = d.epoch
+		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -612,6 +649,20 @@ func (a *Auth) AdoptCredentials(src *Auth) error {
 		}
 		a.FilePath = src.FilePath
 	}
+	// —— 身份与展示字段：重新登录**不改**（唯一例外：目标账号原本就缺该字段）——
+	//
+	// 这不是"图省事"：UID / Nickname / EnterpriseID 在仓库里有大量**无锁**读点
+	// （面板任务中心、autotask、taskjobs、状态渲染都直接读 a.UID / a.Nickname），
+	// 而 AdoptCredentials 只持 a.mu。若重登改写它们，就与那些读者构成数据竞争
+	// （go test -race 已实测到 UID 的竞争）。改成"重登只换凭据，不换身份"后：
+	//   - 竞争面消失（这几个字段装载后不再变）；
+	//   - 落盘与内存一致（写文件也取同样的值，不会出现"文件里新昵称、内存里旧昵称"）。
+	// 真需要更新昵称/企业标识时，那是"重新导入/重加账号"的语义，不是重登。
+	if a.UID != "" {
+		next.uid = a.UID
+	}
+	next.nickname = a.Nickname
+	next.enterpriseID = a.EnterpriseID
 	// 保留项合并。
 	if next.deviceToken == "" {
 		next.deviceToken = a.DeviceToken
@@ -619,6 +670,9 @@ func (a *Auth) AdoptCredentials(src *Auth) error {
 	if strings.TrimSpace(next.realm) == "" {
 		next.realm = a.realm
 	}
+	// 代次在落盘**之前**定稿：文件里写的就是「替换完成后内存里的代次」，
+	// 两者必须一致，否则重启对账（pool.reconcileCredEpochLocked）会误判。
+	next.epoch = a.credEpoch + 1
 
 	// 先落盘：失败直接返回，下面任何一行都不会执行到。
 	if err := a.writeLocked(next); err != nil {
@@ -632,10 +686,20 @@ func (a *Auth) AdoptCredentials(src *Auth) error {
 	a.ExpiresAt = next.expiresAt
 	a.Domain = next.domain
 	a.realm = next.realm
-	a.UID = next.uid
-	a.EnterpriseID = next.enterpriseID
-	a.Nickname = next.nickname
-	a.DeviceToken = next.deviceToken
+	// 身份/展示字段只在目标原本为空时补全（见上方说明），常见路径不写：
+	// 避免与面板/任务中心那些无锁读者构成数据竞争。
+	if a.UID == "" {
+		a.UID = next.uid
+	}
+	if a.EnterpriseID == "" {
+		a.EnterpriseID = next.enterpriseID
+	}
+	if a.Nickname == "" {
+		a.Nickname = next.nickname
+	}
+	if a.DeviceToken != next.deviceToken {
+		a.DeviceToken = next.deviceToken
+	}
 	a.credEpoch++
 	return nil
 }

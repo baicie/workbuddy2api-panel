@@ -1123,10 +1123,9 @@ type refreshCall struct {
 // 持有旧快照的调用方与已换新的调用方区分开；UID 为空时回落 FilePath/指针
 // （生产账号两者都有值，测试可用 UID 固定 key）。
 func refreshKey(a *auth.Auth, rt string) string {
-	id := a.UID
-	if id == "" {
-		id = a.FilePath
-	}
+	// 经锁内访问器读身份：历史上这里无锁直读 a.UID / a.FilePath，与重新登录
+	// （AdoptCredentials 在锁内改写字段）并发时构成数据竞争。
+	id := a.KeyID()
 	if id == "" {
 		id = fmt.Sprintf("%p", a)
 	}

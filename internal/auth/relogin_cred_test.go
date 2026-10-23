@@ -125,8 +125,15 @@ func TestAdoptCredentialsReplacesInPlace(t *testing.T) {
 	if got.expiresAt != src.ExpiresAt || got.domain != src.Domain {
 		t.Errorf("过期时间/域未换新: exp=%d domain=%q", got.expiresAt, got.domain)
 	}
-	if got.enterpriseID != "ent-new" || got.nickname != "New Nick" {
-		t.Errorf("身份展示字段未换新: ent=%q nick=%q", got.enterpriseID, got.nickname)
+	// 身份/展示字段：重登**不换**（只换凭据）。这是根因级的设计约束而不是遗漏——
+	// a.UID / a.Nickname / a.EnterpriseID 在面板任务中心、autotask、taskjobs 里有大量
+	// **无锁**读点，而 AdoptCredentials 只持 a.mu；若重登改写它们，就与那些读者构成
+	// 数据竞争（go test -race 实测抓到过 UID 的竞争）。因此约定：重登只换
+	// AT/RT/ExpiresAt/Domain/realm（+ 缺省时补全 DeviceToken），身份展示保持装载时的值。
+	// 需要更新昵称/企业标识属于"重新导入账号"的语义，不是重登。
+	if got.enterpriseID != "ent-old" || got.nickname != "Old Nick" {
+		t.Errorf("身份展示字段被改写: ent=%q nick=%q want ent-old/Old Nick（重登只换凭据）",
+			got.enterpriseID, got.nickname)
 	}
 	if got.uid != "u1" {
 		t.Errorf("uid 不该变: %q", got.uid)
@@ -161,8 +168,10 @@ func TestAdoptCredentialsReplacesInPlace(t *testing.T) {
 	if r := parsed.RealmStored(); r != "cn" {
 		t.Errorf("磁盘 realm=%q want cn", r)
 	}
-	if parsed.UID != "u1" || parsed.Nickname != "New Nick" {
-		t.Errorf("磁盘身份=%q/%q want u1/New Nick", parsed.UID, parsed.Nickname)
+	// 磁盘身份必须与内存一致（都保持装载值）：否则重启后 LoadDir 会读到另一个昵称，
+	// 出现"内存旧名、磁盘新名"的漂移。
+	if parsed.UID != "u1" || parsed.Nickname != "Old Nick" {
+		t.Errorf("磁盘身份=%q/%q want u1/Old Nick（与内存一致）", parsed.UID, parsed.Nickname)
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
