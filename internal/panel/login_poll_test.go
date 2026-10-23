@@ -16,6 +16,10 @@ import (
 //   - 网络抖动 / 5xx：继续轮询（OAuth 可能已在浏览器侧完成，停掉账号就永远不入池）；
 //   - 404 / 410：会话作废，停止并提示重新发起；
 //   - 成功：作废 packages 缓存（否则「重新登录后点检查还是 401」）并回显余额校验失败。
+//
+// 切片用 **严格模式** 求值（与 app.js 首行 'use strict' 一致，上游 9151570 的做法）：
+// sloppy 模式会静默接受未声明赋值并隐式造出全局，测试口径就与线上不一致——
+// 重登文案/状态分档这类新代码一旦漏写声明，这里必须能当场红，而不是线上才炸。
 func TestAppJSPollLoginResilience(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -48,7 +52,7 @@ const ctx = {
   loginTimer: 7,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.pollLogin = pollLogin; this.getFails = () => pollFails; this.getTimer = () => loginTimer;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.pollLogin = pollLogin; this.getFails = () => pollFails; this.getTimer = () => loginTimer;', ctx);
 
 const out = {};
 (async () => {

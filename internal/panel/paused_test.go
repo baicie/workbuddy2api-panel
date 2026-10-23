@@ -101,6 +101,9 @@ func TestOverviewExposesPausedFlag(t *testing.T) {
 //
 // 为什么值得一测：s.paused 拼错/字段名漂移时前端会静默退回「可用」+「禁用」，
 // 后端全绿而功能在界面上不存在（本仓踩过一次同类的静默渲染回归）。
+// 注：本测试的 app.js 切片用严格模式求值（app.js 首行即 'use strict'），
+// 因为 renderAccounts 里含本次新增的「需重新授权/重新登录」判定——sloppy 模式下
+// 漏写声明会被静默接受，测试口径与线上不一致（上游 9151570 同口径）。
 func TestAppJSAccountRowPausedBadgeAndButton(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -121,7 +124,7 @@ const ctx = {
   rateLimitRowsHtml: () => '', formatTokenCount: () => '0', formatLatency: () => '-', formatRate: () => '-',
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.renderAccounts = renderAccounts;', ctx);
 const base = { uid: 'u1', nickname: 'A', credits: 100, credits_total: 100, success_count: 1, err_total: 0 };
 ctx.renderAccounts([Object.assign({}, base, { paused: true })]);
 assert.ok(tb.innerHTML.includes('已暂停选号'), 'paused 行应显示已暂停选号: ' + tb.innerHTML);
