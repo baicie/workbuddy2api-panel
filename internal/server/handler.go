@@ -1790,9 +1790,25 @@ func validUsageCredit(credit float64, present bool) bool {
 	return present && !math.IsNaN(credit) && !math.IsInf(credit, 0) && credit >= 0
 }
 
+// usageTotalTokensLimit token 计数的值域闸门上限（不含）：2^63。
+//
+// 为什么是 2^63 而不是 MaxInt64：float64 只有 52 位尾数，MaxInt64 = 2^63-1 在
+// float64 里根本不可精确表示——float64(math.MaxInt64) 会舍入回 2^63。于是
+// 「先 int(total) 再比 float64(parsed) != total」的 round-trip 校验在边界上必然
+// 失效：total = 2^63 越界转 int 是实现定义的（本平台饱和到 MaxInt64），
+// float64(MaxInt64) 又恰好舍回 2^63，两边相等 → 越界值被当成合法 token 数放行
+// （usage.credit=0 + total_tokens=2^63 能通过计费闸门，2^63 个 token 计进成本账本）。
+// 所以值域必须在**转换前**判定：严格小于 2^63 的 float64 整数值全都精确落进
+// int64（无实现定义行为），恰好 2^63 及以上一律拒绝。
+const usageTotalTokensLimit = float64(1 << 63) // 2^63，float64 可精确表示，故比较安全
+
 // parseUsageTotalTokens 只接受落在 int 范围的有限正整数（小数/越界/NaN 一律拒绝）。
 func parseUsageTotalTokens(total float64) (int, bool) {
 	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+		return 0, false
+	}
+	// 值域闸门在转换之前：越界转换是实现定义的，不能靠转换后的 round-trip 兜底。
+	if total >= usageTotalTokensLimit {
 		return 0, false
 	}
 	parsed := int(total)

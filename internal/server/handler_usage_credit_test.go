@@ -43,6 +43,57 @@ func TestUsageCreditTotalRequiresValidExplicitCreditAndTokens(t *testing.T) {
 	}
 }
 
+// TestUsageTotalTokensInt64BoundaryRejected 2^63 必须拒绝：值域闸门必须在「转换前」，
+// 转换后的 round-trip 校验在边界上是失效的。
+//
+// 钉住的是一类「校验看着对、边界上必失效」的坑，不是编造的极端输入：
+//   - float64 尾数只有 52 位，MaxInt64 = 2^63-1 不可精确表示，float64(math.MaxInt64)
+//     会舍入回 2^63（下面第一条断言就是这条 spec 级事实，与平台无关）；
+//   - 越界 float64 → int 转换是实现定义的（amd64/arm64 上饱和到 MaxInt64）；
+//   - 于是旧实现「先 int(total) 再比 float64(parsed) != total」在 total = 2^63 上
+//     恒等成立（饱和成 MaxInt64，MaxInt64 又舍回 2^63），越界值被当成合法 token 数
+//     放行，usage.credit=0 + total_tokens=2^63 直接通过计费闸门。
+//
+// 闸门放在转换之前后，只接受严格小于 2^63 的整数：该区间的 float64 整数值都能
+// 精确落进 int64，转换无实现定义行为。
+func TestUsageTotalTokensInt64BoundaryRejected(t *testing.T) {
+	limit := math.Exp2(63) // 2^63
+
+	// spec 级陷阱：2^63 这个 float64 值恰好就是 float64(MaxInt64)（尾数不够，向上舍入）。
+	if float64(math.MaxInt64) != limit {
+		t.Fatalf("float64(MaxInt64)=%.17g 应等于 2^63=%.17g；若不成立说明 round-trip 校验在边界侥幸可用，需重新评估本用例的前提",
+			float64(math.MaxInt64), limit)
+	}
+
+	if got, ok := parseUsageTotalTokens(limit); ok {
+		t.Fatalf("2^63 越界必须拒绝，got total=%d ok=true（round-trip 校验在边界失效）", got)
+	}
+	if got, ok := parseUsageTotalTokens(math.Nextafter(limit, math.Inf(1))); ok {
+		t.Fatalf("超过 2^63 的值必须拒绝，got total=%d ok=true", got)
+	}
+	// 阈值内侧最近的可表示整数必须照旧接受：闸门不能误伤合法的大计数
+	// （本仓构建目标全为 64 位，int 即 int64）。
+	inside := math.Nextafter(limit, 0) // 2^63-1024：小于 2^63 的最大 float64 整数值
+	if got, ok := parseUsageTotalTokens(inside); !ok || float64(got) != inside {
+		t.Fatalf("2^63 以内最大的 float64 整数应接受，got total=%d ok=%v want %.17g", got, ok, inside)
+	}
+
+	// 聚合入口（handler）：与测试表里的 out of range total 同一路径，这里再钉一次确切语义。
+	if _, _, ok := usageCreditTotal(map[string]any{"usage": map[string]any{
+		"credit": float64(0), "total_tokens": limit,
+	}}); ok {
+		t.Fatal("usageCreditTotal 必须拒绝 total_tokens=2^63（否则天量 token 会计进成本账本）")
+	}
+
+	// 流式入口（logging.go 共用 parseUsageTotalTokens，JSON 数字直接解成 float64）：
+	// 越界 total 帧判「未知」并覆盖先前帧，不得采信。
+	reader := &chatStatsReader{}
+	reader.parseSSELine(`data: {"usage":{"credit":0,"total_tokens":9223372036854775808}}`)
+	if total, ok := reader.TotalTokens(); ok {
+		t.Fatalf("流式越界 total 必须判未知，got total=%d", total)
+	}
+}
+
 // TestUsageCreditTotalMissingCreditDoesNotCreateFreeModelObservation 缺 credit 字段
 // 不能被当成「确认免费」写进成本账本（否则保底/分层被脏免费证据污染）。
 func TestUsageCreditTotalMissingCreditDoesNotCreateFreeModelObservation(t *testing.T) {
