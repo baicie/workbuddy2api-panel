@@ -53,7 +53,9 @@ func (s *Scheduler) noteBalanceAuthFailure(a *auth.Auth, uid string, probeErr er
 	// Kind 之外再看一次 code=12153：doJSON 只用 env.Msg 做分类，而上游的 12153 文案
 	// 不总是英文原文（本地化后不含 marker 就会落成 ErrClient，死号便永远不计罚）。
 	if errors.As(rerr, &re) && (re.Kind == upstream.ErrSessionDead || strings.Contains(re.Msg, "12153")) {
-		if s.cfg.Pool.NoteSessionDead(uid) {
+		// 达阈值时同时打上类型化认证故障标记（pool.AuthFaultSessionDead）：面板据此
+		// 显示「需要重新授权」并给重新登录入口，而不是把账号留成一个无来由的 disabled。
+		if s.cfg.Pool.NoteSessionDeadFault(uid, pool.AuthFaultSessionDead, "12153 session dead") {
 			log.Printf("balance %s: 连续 %d 次 401 且 refresh 判死 — 禁用（需重新登录）", label, pool.SessionDeadThreshold())
 			return
 		}
@@ -87,4 +89,21 @@ func (s *Scheduler) noteAuthHeal(uid string) {
 		s.authHealAt = make(map[string]time.Time)
 	}
 	s.authHealAt[uid] = time.Now()
+}
+
+// ClearAuthHeal 清掉账号的「401 求证」退避记录。
+//
+// 重新登录成功后调用：退避窗口的作用是防止降级 token 每轮都轮换 RT，而新授权
+// 已经把 RT 换成全新的、且尚未被证明是降级 token——若继续沿用旧窗口，重登后的
+// 第一次余额探测会白白被跳过（最长 30 分钟），运维看到的现象是「刚重登完余额
+// 还是旧的/还是 401」，误以为重登没生效。
+//
+// 无副作用且幂等：uid 不带记录时为空操作。并发安全（与 allowAuthHeal 同锁）。
+func (s *Scheduler) ClearAuthHeal(uid string) {
+	if s == nil {
+		return
+	}
+	s.authHealMu.Lock()
+	defer s.authHealMu.Unlock()
+	delete(s.authHealAt, uid)
 }

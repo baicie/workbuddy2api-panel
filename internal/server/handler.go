@@ -1101,7 +1101,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 刷新时就判死（refresh 令牌已失效）：只能重登，打类型化标记。
+					h.cfg.Pool.DisableAuth(acct.UID, "refresh session dead", pool.AuthFaultSessionDead)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -1923,13 +1924,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     一次就禁会在上游抖一下时把整池打光（这个坑本项目踩过一次）。死号在阈值
 		//     内仍会被选中重试，但最多 3 次即出池，不再每请求刷 401。
 		if uerr != nil && upstream.IsGatewayUnauthorized(uerr.Status, body) {
-			if h.cfg.Pool.NoteSessionDeadWith(uid, gatewayUnauthorizedReason) {
+			// 显式标注类型化故障：面板据此区分「网关 401 判死」与「12153 判死」两种成因。
+			if h.cfg.Pool.NoteSessionDeadFault(uid, pool.AuthFaultGateway401, gatewayUnauthorizedReason) {
 				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401（token 被上游判无效）→ 禁用，需重新登录",
 					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
 			}
 			return
 		}
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 业务 12153：认证失效终态，打上类型化标记，面板/运维据此走「重新登录」而不是
+		// 盲目「解冻」（解冻会把管理员暂停等状态一起清掉，见 pool.ClearAuthFault）。
+		h.cfg.Pool.DisableAuth(uid, "12153 session dead", pool.AuthFaultSessionDead)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

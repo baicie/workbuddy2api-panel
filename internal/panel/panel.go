@@ -94,6 +94,11 @@ type Panel struct {
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+	// reloginBusy 正在**发起**重新登录的账号（uid → true），覆盖「已通过查重但
+	// state 还没拿到」的窗口：只查 logins 挡不住双击（两个请求都在会话入表之前
+	// 通过校验，最终各自拿到一个 state，指向同一账号的文件抢写）。
+	// 由 loginMu 保护；发起失败/会话入表后立即释放。
+	reloginBusy map[string]bool
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -154,6 +159,23 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
+// LoginMode OAuth 会话的用途：新增账号 / 重新登录（401 失效账号原位恢复）。
+//
+// 两种模式共用同一套设备授权端点、state 表、TTL 与轮询闸门，但完成分支的**副作用
+// 完全不同**，所以必须显式区分而不是靠「uid 是否已在池里」推断：
+//   - 新增：建凭证 → 落盘 → pool.Add → Revive（人工恢复口径）→ 签到/激活 →
+//     StartNewAccountTasks（只该对全新账号跑一次）；
+//   - 重新登录：校验身份/域 → 原位换凭据（保留账号条目与全部业务状态）→
+//     窄口径清认证故障 → 绝不跑「新账号初始化」。
+type LoginMode string
+
+const (
+	// LoginModeAdd 添加新账号（既有行为，零回归）。
+	LoginModeAdd LoginMode = "add"
+	// LoginModeRelogin 已有账号重新授权（只换凭据，不新增账号）。
+	LoginModeRelogin LoginMode = "relogin"
+)
+
 // loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
 type loginSession struct {
 	created time.Time
@@ -161,6 +183,14 @@ type loginSession struct {
 	// processing 该 state 正在落盘（含签到/余额校验等副作用）。前端每 3s 轮询，而成功
 	// 分支的副作用可能耗时数秒：没有这个闸门，第二个并发 poll 会把整段流程再跑一遍。
 	processing bool
+	// mode 会话用途（新增 / 重新登录）。零值 = 新增账号（旧调用方/旧测试零回归）。
+	mode LoginMode
+	// targetUID 重新登录的目标账号 UID（mode=relogin 时必填）。
+	// 来源只有一个：池内现有账号。**不接受前端指定**——否则一次请求就能把
+	// A 账号的授权写进 B 账号，等于凭空搬运账号身份。
+	targetUID string
+	// targetNickname 目标账号昵称（仅回显给前端展示"正在给谁重登"，不参与校验）。
+	targetNickname string
 }
 
 // New 构建面板。
@@ -169,11 +199,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		started:     time.Now(),
+		logs:        NewRing(500),
+		logins:      map[string]loginSession{},
+		reloginBusy: map[string]bool{},
 	}
 	p.routes()
 	return p
@@ -198,7 +229,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/model_toggle", p.withAuth(p.modelToggle))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
+	p.mux.HandleFunc("POST /panel/api/login/cancel", p.withAuth(p.loginCancel))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	// 401/12153 失效账号的**原位**重新登录：绑定池内现有账号的 uid+realm，
+	// 授权成功后只换凭据、不删号重建（详见 relogin.go）。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/relogin/start", p.withAuth(p.reloginStart))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.withAuth(p.addAPIKey))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
