@@ -463,12 +463,17 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
+//
+// 绑定前先做**凭证代次对账**（reconcileCredEpochLocked）：auth 文件里的代次比
+// state.json 记录的新，说明上次「换凭据成功、state.json 写失败」，此时要按窄口径
+// 把已失效的认证禁用纠正回来，否则重启后账号永久卡在「需重新登登录」。
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	if e, ok := p.byUID[a.UID]; ok {
+		p.reconcileCredEpochLocked(e, a)
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	p.byUID[a.UID] = &entry{a: a, authEpoch: a.Epoch()}
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

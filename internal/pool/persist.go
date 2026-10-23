@@ -116,10 +116,24 @@ func (p *Pool) startFlusher() {
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) && !p.saveLocked() {
-		p.dirty.Store(true) // 同上：失败置回，留给下一次 Flush/后台 tick 重试
+	defer p.mu.Unlock()
+	p.flushLocked()
+}
+
+// flushLocked Flush 的无锁实现（调用方必须已持 p.mu 写锁）。
+// 返回 false = 有变更但落盘失败（已把 dirty 置回，留给后台 tick/下次 Flush 重试）。
+//
+// 为什么要返回 bool：重新登录路径必须能区分「授权成功 + 状态已持久化」与
+// 「授权成功 + 状态待补」，接口不允许把两者含糊地报成同一个成功。
+func (p *Pool) flushLocked() bool {
+	if !p.dirty.Swap(false) {
+		return true // 无变更 = 磁盘已是最新
 	}
-	p.mu.Unlock()
+	if p.saveLocked() {
+		return true
+	}
+	p.dirty.Store(true) // 失败置回，留给下一次 Flush/后台 tick 重试
+	return false
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
@@ -183,6 +197,12 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			// 恢复它是为了重启后面板仍显示「需重新登录」而不用等下一轮 401 重新学。
 			authFault:   faultForKey(string(s.AuthFault)),
 			authFaultAt: s.AuthFaultAt,
+			// 禁用成因：旧 state.json 无该键时按「安全侧」还原——已禁用且无成因的存量
+			// 账号记为 unknown（重登录不会自动解禁，需人工解冻）；未禁用则为 none。
+			// 兼容本分支更早的中间格式：当时只有 auth_fault 没有 disabled_cause，
+			// 若 disabled && auth_fault != "" 说明正是认证禁用，还原为 auth。
+			disabledCause: restoredDisableCause(s),
+			authEpoch:     s.AuthEpoch,
 		}
 		// 亚积分余量合法性：越界/非有限值（旧数据或手改）清 0，保守回退整数口径。
 		if math.IsNaN(e.creditsRemainder) || math.IsInf(e.creditsRemainder, 0) || e.creditsRemainder < -0.5 || e.creditsRemainder >= 0.5 {
@@ -331,6 +351,26 @@ func (p *Pool) notePersistFail(err error) {
 	p.persistFails++
 }
 
+// restoredDisableCause 从 state.json 还原禁用成因，兼容三种历史形态：
+//
+//	① 新格式：直接读 disabled_cause；
+//	② 本分支中间格式：只有 auth_fault、没有 disabled_cause —— disabled 且
+//	   auth_fault 非空即认证禁用，还原成 auth（否则重启后该号永远无法用重登恢复）；
+//	③ 上游/更早格式：只有 disabled + reason —— 无从判断成因，记为 unknown
+//	   （重登录不自动解禁，需人工「解冻」，这是安全侧默认）。
+func restoredDisableCause(s stateAccount) DisableCause {
+	if !s.Disabled {
+		return DisableCauseNone
+	}
+	if c := NormalizeDisableCause(string(s.DisabledCause)); c != DisableCauseNone {
+		return c
+	}
+	if faultForKey(string(s.AuthFault)) != AuthFaultNone {
+		return DisableCauseAuth
+	}
+	return DisableCauseUnknown
+}
+
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
@@ -352,6 +392,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			SessionDeadFails:         e.sessionDeadFails,
 			AuthFault:                e.authFault,
 			AuthFaultAt:              e.authFaultAt,
+			AuthEpoch:                e.authEpoch,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
@@ -363,6 +404,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		// 长生不老并被重启原样拾回（issue #207-4）。
 		if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
 			s.Reason, s.Until, s.CoolKind = e.reason, e.until, e.coolKind
+		}
+		// 禁用成因只在禁用时落盘（未禁用时成因无意义，留着会让 state.json 出现
+		// 「disabled=false 但 cause=admin」的脏组合）。
+		if e.disabled {
+			s.DisabledCause = e.disabledCause
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {

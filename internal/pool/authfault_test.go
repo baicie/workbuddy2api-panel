@@ -311,7 +311,7 @@ func TestReplaceCredentialsKeepsPoolIdentityAndStats(t *testing.T) {
 		Nickname:     "New",
 		FilePath:     old.FilePath,
 	}
-	if err := p.ReplaceCredentials("u1", src); err != nil {
+	if _, err := p.ReplaceCredentials("u1", src); err != nil {
 		t.Fatalf("ReplaceCredentials: %v", err)
 	}
 
@@ -366,11 +366,11 @@ func TestReplaceCredentialsKeepsPoolIdentityAndStats(t *testing.T) {
 func TestReplaceCredentialsUnknownUID(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1", AccessToken: "at"})
-	err := p.ReplaceCredentials("nope", &auth.Auth{AccessToken: "at-new", UID: "nope"})
+	_, err := p.ReplaceCredentials("nope", &auth.Auth{AccessToken: "at-new", UID: "nope"})
 	if !errors.Is(err, ErrAccountNotFound) {
 		t.Fatalf("err=%v want ErrAccountNotFound", err)
 	}
-	if err := p.ReplaceCredentials("u1", nil); err == nil {
+	if _, err := p.ReplaceCredentials("u1", nil); err == nil {
 		t.Fatal("nil src 应报错")
 	}
 	// 池内账号不受影响。
@@ -405,7 +405,7 @@ func TestReplaceCredentialsFailureKeepsAccountState(t *testing.T) {
 	t.Run("UID 不一致", func(t *testing.T) {
 		p, a := setup(t)
 		fileBefore, _ := os.ReadFile(a.FilePath)
-		err := p.ReplaceCredentials("u1", &auth.Auth{AccessToken: "at-evil", UID: "other"})
+		_, err := p.ReplaceCredentials("u1", &auth.Auth{AccessToken: "at-evil", UID: "other"})
 		if err == nil {
 			t.Fatal("UID 不一致必须报错（不得串号覆盖）")
 		}
@@ -425,7 +425,7 @@ func TestReplaceCredentialsFailureKeepsAccountState(t *testing.T) {
 	t.Run("空 accessToken", func(t *testing.T) {
 		p, a := setup(t)
 		fileBefore, _ := os.ReadFile(a.FilePath)
-		if err := p.ReplaceCredentials("u1", &auth.Auth{AccessToken: " ", UID: "u1"}); err == nil {
+		if _, err := p.ReplaceCredentials("u1", &auth.Auth{AccessToken: " ", UID: "u1"}); err == nil {
 			t.Fatal("空 accessToken 必须报错")
 		}
 		if st, _ := p.Status("u1"); !st.NeedsRelogin {
@@ -441,7 +441,7 @@ func TestReplaceCredentialsFailureKeepsAccountState(t *testing.T) {
 		p, a := setup(t)
 		// 目标目录被移除 → 原子写盘失败（真实部署里 auths 卷掉线的形态）。
 		a.FilePath = filepath.Join(t.TempDir(), "unmounted", "workbuddy-u1.json")
-		err := p.ReplaceCredentials("u1", &auth.Auth{
+		_, err := p.ReplaceCredentials("u1", &auth.Auth{
 			AccessToken: "at-new", UID: "u1", FilePath: a.FilePath,
 		})
 		if err == nil {

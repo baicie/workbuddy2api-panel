@@ -95,8 +95,13 @@ type Status struct {
 	AuthFault string `json:"auth_fault,omitempty"`
 	// AuthFaultAt 打出认证故障标记的时刻（观测用；零值 = 无标记）。
 	AuthFaultAt time.Time `json:"auth_fault_at,omitempty"`
-	// NeedsRelogin 「需要重新授权」的合成口径 = disabled && AuthFault != ""。
+	// DisabledCause 禁用成因（"auth"/"admin"/"upstream"/"unknown"；空 = 未禁用）。
+	// 与 DisabledReason 的分工：reason 是给人看的文案，cause 是机器判据——
+	// 「能不能靠重新登录恢复」只看 cause，绝不解析 reason 文本。
+	DisabledCause string `json:"disabled_cause,omitempty"`
+	// NeedsRelogin 「需要重新授权」的判定口径 = disabled && disabled_cause == "auth"。
 	// 单独透出是为了让前端/外部脚本不必自己拼条件（也避免两处口径漂移）。
+	// 注意：**不是**看 AuthFault——管理员禁用期间观测到的 401 不会让这个为真。
 	NeedsRelogin bool `json:"needs_relogin,omitempty"`
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
@@ -306,6 +311,15 @@ type entry struct {
 	// 而不是一个没有来由的 disabled 账号。
 	authFault   AuthFault
 	authFaultAt time.Time
+	// disabledCause 本次禁用的成因（见 authfault.go 的 DisableCause 与优先级）。
+	// 是「重登录能否自动解禁」的唯一判据；disableLocked 每次禁用先清零，
+	// 由 applyDisableLocked 按优先级写入。
+	// 持久化（stateAccount.DisabledCause）：重启后仍能区分管理员禁用与认证禁用。
+	disabledCause DisableCause
+	// authEpoch state.json 里记录的凭证代次（与 auth 文件里的 auth.epoch 对账）。
+	// 只用于跨重启修复「凭据换新成功但 state.json 写失败」的窗口，见
+	// pool.reconcileCredEpochLocked。
+	authEpoch uint64
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -565,6 +579,11 @@ type stateAccount struct {
 	AuthFault AuthFault `json:"auth_fault,omitempty"`
 	// AuthFaultAt 认证故障标记时刻（观测用）。
 	AuthFaultAt time.Time `json:"auth_fault_at,omitempty"`
+	// DisabledCause 禁用成因（见 DisableCause）。空 = 未禁用；旧文件缺该键时，
+	// 加载侧按「已在 authfault.go 推断」的规则还原（不把存量禁用误判成需重登）。
+	DisabledCause DisableCause `json:"disabled_cause,omitempty"`
+	// AuthEpoch state.json 记录的凭证代次（与 auth 文件 auth.epoch 对账用）。
+	AuthEpoch uint64 `json:"auth_epoch,omitempty"`
 	// ConsecutiveFails 连续失败计数（连败降权进度，见 entry.consecutiveFails）。
 	ConsecutiveFails int `json:"consecutive_fails"`
 	// DegradeUntil 连败降权截止（issue #114）。仅未过期才持久化（落盘/恢复均惰性

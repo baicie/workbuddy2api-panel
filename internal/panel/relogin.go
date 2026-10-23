@@ -347,7 +347,8 @@ func (p *Panel) finishRelogin(w http.ResponseWriter, state string, sess loginSes
 	}
 
 	// ---- 落盘 + 原位换内存（失败时旧凭证/旧状态完好，绝不会假成功）----
-	if err := p.cfg.Pool.ReplaceCredentials(target, next); err != nil {
+	rep, err := p.cfg.Pool.ReplaceCredentials(target, next)
+	if err != nil {
 		log.Printf("ERROR: panel: 重新登录凭据写入失败 %s: %v", label, err)
 		writeErr(w, http.StatusInternalServerError,
 			"重新授权成功但凭据写入失败，已保留原有凭证与账号状态："+err.Error())
@@ -362,36 +363,71 @@ func (p *Panel) finishRelogin(w http.ResponseWriter, state string, sess loginSes
 
 	// ---- 登录成功 ≠ 上游全部服务可用：余额单独求证、单独回报 ----
 	// Billing 401 不能否定 Chat 可用性（降级 token 的既有结论），所以这里只把结果
-	// 如实回传（balance_ok / balance_error），**不因为余额失败而回滚或禁用账号**。
+	// 如实回传（billing_verified / balance_error），**不因为余额失败而回滚或禁用账号**。
 	remain, total := int64(-1), int64(0)
 	balanceOK := true
 	balanceErr := ""
 	if p.cfg.Upstream != nil {
-		if rm, tt, err := p.cfg.Upstream.UserResource(next); err == nil {
+		if rm, tt, uerr := p.cfg.Upstream.UserResource(next); uerr == nil {
 			remain, total = rm, tt
 			// 与既有余额刷新同口径：余额恢复可解「余额耗尽硬冷却」，但不动熔断/限流态。
 			p.cfg.Pool.ReenableIfCredits(target, rm, tt)
 		} else {
 			balanceOK = false
-			balanceErr = err.Error()
-			log.Printf("panel: 重新登录后余额校验失败 %s: %v（不影响重登结果，Chat 可能仍可用）", label, err)
+			balanceErr = uerr.Error()
+			log.Printf("panel: 重新登录后余额校验失败 %s: %v（不影响重登结果，Chat 可能仍可用）", label, uerr)
 		}
 	}
 
-	log.Printf("panel: 账号已重新授权并原位生效 %s（凭证已换新，账号条目/统计/配置保持不变）", label)
+	// ---- 如实回报：把「授权完成」「凭据已换」「是否回到选号」「Chat/Billing 各验到哪一步」分开 ----
+	// 绝不因为 auth_ok=true 就笼统说「账号已恢复」：账号可能仍被管理员禁用、可能仍暂停选号，
+	// 也可能换了凭据但 chat 根本没验证过。前端按各字段决定文案（见 app.js pollLogin）。
+	warnings := make([]string, 0, 3)
+	if !rep.StatePersisted {
+		warnings = append(warnings, "运行状态未写入 state.json（重启后会按凭证代次自动校正）")
+	}
+	if rep.Disabled {
+		cause := ""
+		if st, ok := p.cfg.Pool.Status(target); ok {
+			cause = st.DisabledReason
+		}
+		warnings = append(warnings, "账号仍处于禁用状态（"+cause+"），需人工解冻后才会重新参与选号")
+	}
+	if rep.Paused {
+		warnings = append(warnings, "账号仍处于暂停选号，签到/保活照常但不接流量")
+	}
+
+	log.Printf("panel: 账号已重新授权 %s（credentials_updated=true recovered=%v in_rotation=%v state_persisted=%v）",
+		label, rep.Recovered, rep.InRotation(), rep.StatePersisted)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":     true,
 		"mode":     string(LoginModeRelogin),
 		"relogin":  true,
-		"auth_ok":  true,
 		"uid":      target,
 		"nickname": acct.Nickname,
 		"realm":    sess.realm,
+
+		// —— 分阶段真实状态（前端不得把它们合并成一个「成功」）——
+		"auth_ok":             true,               // OAuth 完成且身份/域校验通过
+		"credentials_updated": true,               // 凭据已换新并 fsync 落盘（auth 文件）
+		"state_persisted":     rep.StatePersisted, // 运行状态是否已落盘
+		"recovered":           rep.Recovered,      // 认证禁用是否真的被解除
+		"in_rotation":         rep.InRotation(),   // 当前是否已回到可选号状态
+		"disabled":            rep.Disabled,
+		"paused":              rep.Paused,
+		"cooling":             rep.Cooling,
+		"credentials_epoch":   rep.Epoch,
+
+		// Chat 未做任何探测：宁可标「未验证」也不伪造健康结论。
+		"chat_verified": false,
+		// Billing 单独求证（401 只说明计费通道不可用，不等于 Chat 不可用）。
+		"billing_verified": balanceOK,
+		"balance_ok":       balanceOK,
+		"balance_error":    balanceErr,
 		// 余额字段与添加账号同形：-1 = 未知/未查询成功。
 		"credits":         remain,
 		"credits_total":   total,
-		"balance_ok":      balanceOK,
-		"balance_error":   balanceErr,
 		"checkin_message": "",
+		"warnings":        warnings,
 	})
 }

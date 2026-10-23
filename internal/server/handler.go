@@ -1970,7 +1970,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 					"channel verification blocked (11-128 request illegal)")
 				return
 			}
-			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+			// 上游风控封禁：成因记为 upstream，与「认证失效」彻底分开——
+			// 重登录不会解除它（凭据换新也解不开封号），面板也不会显示「需重新登录」。
+			h.cfg.Pool.DisableWithCause(uid, pool.DisableCauseUpstream,
+				"account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
