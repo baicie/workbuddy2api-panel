@@ -53,6 +53,11 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
+	// 认证故障标记由**认证路径**（DisableAuth / NoteSessionDeadFault）在本函数返回后
+	// 重新写入；这里先清空，保证「非认证原因的禁用」不会残留上一次的认证标记
+	// （否则 ClearAuthFault 会误判这次禁用是认证造成的，把管理员/风控的禁用解掉）。
+	e.authFault = AuthFaultNone
+	e.authFaultAt = time.Time{}
 	p.dirty.Store(true)
 }
 

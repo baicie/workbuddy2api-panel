@@ -179,6 +179,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
+			// 认证故障标记：归一化已知枚举（旧文件缺键 = 零值 = 无故障；脏值降级为无故障）。
+			// 恢复它是为了重启后面板仍显示「需重新登录」而不用等下一轮 401 重新学。
+			authFault:   faultForKey(string(s.AuthFault)),
+			authFaultAt: s.AuthFaultAt,
 		}
 		// 亚积分余量合法性：越界/非有限值（旧数据或手改）清 0，保守回退整数口径。
 		if math.IsNaN(e.creditsRemainder) || math.IsInf(e.creditsRemainder, 0) || e.creditsRemainder < -0.5 || e.creditsRemainder >= 0.5 {
@@ -346,6 +350,8 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			TokenUsage:               e.tokenUsage,
 			SoftStreak:               e.softStreak,
 			SessionDeadFails:         e.sessionDeadFails,
+			AuthFault:                e.authFault,
+			AuthFaultAt:              e.authFaultAt,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
