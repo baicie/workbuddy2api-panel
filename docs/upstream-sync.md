@@ -25,7 +25,8 @@ upstream  https://github.com/misakano7545/workbuddy2api-panel.git (push)
 
 | 事实 | 值 | 影响 |
 |---|---|---|
-| 当前分支 | `feat/account-relogin`（基线 `main` = `f8f6db6`，与 `upstream/main` 同源） | 同步在临时分支上做，不直接动 `main` |
+| 当前分支 | `feat/account-relogin`（本地领先 `main` 12 个提交；`main` 仍 = `f8f6db6`，与上游同源） | 同步在临时分支上做，不直接动 `main`；功能分支用 merge 吸收上游（见 §2 变体） |
+| 本地与上游差距 | `git rev-list --left-right --count main...upstream/main` = `0 1` —— 上游领先 1 个提交（`9151570`，尚未同步） | 同步前先看 §6「上游动态与同步记录」的预演结论 |
 | 本地克隆形态 | **浅克隆**（`git rev-parse --is-shallow-repository` → `true`，历史只有一个提交） | 日常 merge/diff 够用；需要考古、revert、跨大版本对比时先 `git fetch --unshallow` |
 | 上游多余分支 | `upstream/autobot/*`、`upstream/ci/*`、`upstream/feat/*`、`upstream/fix/*` | 只同步 `upstream/main`，其余不动 |
 | module 路径 | `github.com/misakano7545/workbuddy2api-panel` | 不可改，改了会让 CI 与上游 PR 路径全失效 |
@@ -234,3 +235,29 @@ git log --oneline -1                             # 确认要发的提交已在 m
 > 本机（macOS，Apple date）实测：`%-m`/`%-d`/`%-H` 可用，`TZ=Asia/Shanghai` 与 `TZ=UTC` 的小时不同（13 vs 05），因此不会进入 GNU `date -d` 回退分支；在 Windows/git-bash（GNU date、无 tzdata）下第一行会静默回落 UTC，第二行的条件会命中并用 `date -u -d '+8 hours'` 纠正。
 
 同步与发版的关系：**先完成上游同步并测试通过，再打时间标签**。`git fetch upstream` 会自动跟进上游 tag（`v2026.10.22.*` 等），那只是本地参考：不复用其版本号、不在 upstream 上打任何标签、不用上游 tag 触发自己的 Release —— 自己的工作流只认 `origin` 上自己的 `v*` 时间标签。
+
+---
+
+## 6. 上游动态与同步记录
+
+### 上游最新提交（待同步）
+
+| 提交 | 主题 | 与本 fork 的关系 |
+|---|---|---|
+| `9151570` | `fix(panel): 错误汇总 title 用全文；前端切片求值统一严格模式` | 只涉及面板错误汇总展示与前端测试求值方式；与本功能的运行时代码无交集 |
+
+当前差距：`main...upstream/main` = `0 1`（上游领先 1 个提交）。
+
+### 合并预演结论（只读审查实测，未实际合并）
+
+| 检查项 | 结论 |
+|---|---|
+| 冲突 | **双向 0 冲突**：`git merge-tree --write-tree main upstream/main` 与 `git merge-tree --write-tree HEAD upstream/main` 均 exit 0 |
+| 合并树构建 | `go build ./...` OK |
+| 面板前端测试 | 全绿（`internal/panel` 的 node+vm 切块测试通过） |
+| 结论 | 可直接按 §2 步骤同步；无冲突文件需要人工裁决 |
+
+### 同步时注意
+
+- 上游本轮把**前端切片求值**统一成严格模式，但只覆盖了上游 `internal/panel/frontend_test.go` 的 **28 处**；本仓另有 **14 处**遗留的 sloppy 切片（与本功能无关的既有测试），同步时不要顺手全部改写，留到那次同步里统一处理，避免本次 diff 噪音扩大。
+- 本功能相关的两处切片（`login_poll_test.go`、`paused_test.go`）已在提交 `05c5543` 改为严格模式；同步后重跑 `go test ./internal/panel/ -run 'Relogin|Poll' -v` 确认未被上游改写覆盖。
