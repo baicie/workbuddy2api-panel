@@ -98,7 +98,7 @@ const sandbox = new Proxy({
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 try {
-  vm.runInContext(src, sandbox, { filename: 'app.js' });
+  vm.runInContext("'use strict';\n" + src, sandbox, { filename: 'app.js' });
   console.log('SMOKE OK');
   process.exit(0);
 } catch (e) {
@@ -142,7 +142,7 @@ const end = src.indexOf('function usStat');
 if (start < 0 || end < 0) throw new Error('credit helpers not found');
 const ctx = { Number, String, RegExp };
 vm.createContext(ctx);
-vm.runInContext(
+vm.runInContext("'use strict';\n" + 
   src.slice(start, end) +
   '\nthis.fmtCredit=fmtCredit; this.fmtCreditRatio=fmtCreditRatio; this.fmtModelRate=fmtModelRate;',
   ctx
@@ -190,7 +190,7 @@ const end = src.indexOf('async function loadLogs');
 if (start < 0 || end < 0) throw new Error('logLevel not found');
 const ctx = { String, RegExp };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.logLevel=logLevel;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.logLevel=logLevel;', ctx);
 process.stdout.write(JSON.stringify({
   okTask: ctx.logLevel('panel: task auto uid=df6b07f7 code=Sequential_Tasks_6 status=done progress=10/10->10/10 claimed=true claim_error=""'),
   twoEmpty: ctx.logLevel('panel: task auto uid=x status=done claim_error="" balance_error=""'),
@@ -249,7 +249,7 @@ const ctx = {
   qrowHTML: () => '',
 };
 vm.createContext(ctx);
-vm.runInContext('let taskJobsLoading = false;\n' + src.slice(start, end) +
+vm.runInContext("'use strict';\n" + 'let taskJobsLoading = false;\n' + src.slice(start, end) +
   '\nthis.loadTaskJobs = loadTaskJobs; this.groupsFromJobs = groupsFromJobs; this.setOwner = v => { taskCenterOwner = v; };', ctx);
 ctx.setJobs = v => { store.jobs = v; };
 (async () => {
@@ -323,7 +323,7 @@ const ctx = { String, Number, RegExp, Object, Array, Map, JSON, console, esc: s 
 const dom = new Proxy(function () {}, { get: (t, k) => (k === Symbol.toPrimitive ? () => '' : dom), set: () => true, apply: () => dom });
 Object.assign(ctx, { $: () => dom, document: dom, window: dom, localStorage: dom, location: dom });
 vm.createContext(ctx);
-vm.runInContext(titlesLine + '\n' + src.slice(nameStart, nameEnd) + '\n' + src.slice(jobsStart, jobsEnd) +
+vm.runInContext("'use strict';\n" + titlesLine + '\n' + src.slice(nameStart, nameEnd) + '\n' + src.slice(jobsStart, jobsEnd) +
   '\nthis.GROWTH_TITLES = GROWTH_TITLES;', ctx);
 // ① 只有 desc（后台任务行的真实形状）：第二列出中文说明，代号只出现一次
 const desc = '接受任务 → glm-5.2 真实对话一次 → 对齐模型上报';
@@ -364,7 +364,7 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
@@ -401,6 +401,56 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 错误汇总样本列：正文用截断的 sample，title 必须用未截断的 sample_full。
+// 两者曾是同一个字段，悬停看到的就是同一段残句（issue #61）。
+func TestAppJSErrorSummaryTitleUsesFullSample(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; error summary title test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const start = src.indexOf('function renderErrorSummary');
+const end = src.indexOf('function renderRequestMetrics');
+if ([escStart, escEnd, start, end].some(v => v < 0)) throw new Error('error summary region not found');
+const els = {};
+const ctx = { String, Math, $: id => (els[id] = els[id] || { innerHTML: '', textContent: '' }) };
+vm.createContext(ctx);
+vm.runInContext("'use strict';\n" + src.slice(escStart, escEnd) + src.slice(start, end) +
+  '\nthis.renderErrorSummary=renderErrorSummary; this.esc=esc;', ctx);
+const full = 'WARN: [upstream] chat_stream acct=a(1): upstream 400 model_blocked body={"code":11102,"msg":"model [x] not found","requestId":"req-1"}';
+const short = 'WARN: keepalive a(1): boom';
+ctx.renderErrorSummary({ scanned: 2, updated_at: '12:00:00', rows: [
+  { sev: 'warn', kind: 'k1', count: 1, sample: full.slice(0, 30), sample_full: full },
+  { sev: 'warn', kind: 'k2', count: 1, sample: short },
+]});
+const body = els.errBody.innerHTML;
+process.stdout.write(JSON.stringify({
+  fullInTitle: body.includes('title="' + ctx.esc(full) + '"'),
+  cellTruncated: body.includes('">' + ctx.esc(full.slice(0, 30)) + '</td>'),
+  fallbackTitle: body.includes('title="' + ctx.esc(short) + '"'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "errsum-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("error summary title node test failed: %v\n%s", err, out)
+	}
+	const want = `{"fullInTitle":true,"cellTruncated":true,"fallbackTitle":true}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("error summary title=%s want %s", out, want)
+	}
+}
+
 // 请求记录行必须紧凑、可读，并带上调用来源（IP / UA）；来源缺失时以 — 兜底。
 func TestAppJSRequestLogFormatting(t *testing.T) {
 	node, err := exec.LookPath("node")
@@ -419,7 +469,7 @@ const reqEnd = src.indexOf('function fmtBytes');
 if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
-vm.runInContext(
+vm.runInContext("'use strict';\n" + 
   src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
   '\nthis.requestLogText=requestLogText;',
   ctx
@@ -468,7 +518,7 @@ const end = src.indexOf('function renderCreditHistory');
 if (start < 0 || end < 0) throw new Error('credit history helpers not found');
 const ctx = { Date, Number, String, Math, RegExp, isNaN };
 vm.createContext(ctx);
-vm.runInContext(
+vm.runInContext("'use strict';\n" + 
   src.slice(start, end) +
   '\nthis.creditEntryText=creditEntryText;this.creditHistoryNote=creditHistoryNote;',
   ctx
@@ -515,7 +565,7 @@ const end = src.indexOf('function reqOutcomeTag');
 if (start < 0 || end < 0) throw new Error('reqMatch not found');
 const ctx = {};
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.reqMatch=reqMatch;', ctx);
 const base = { outcome: 'success', client_ip: '203.0.113.7', user_agent: 'python-requests/2.31.0', model: 'cn:glm-5.3', account: '示例(uid8)', request_id: 'req-1' };
 const other = { outcome: 'http_error', client_ip: '198.51.100.4', user_agent: 'Mozilla/5.0 Chrome/120', model: 'global:hy3', account: '甲(uid9)', request_id: 'req-2' };
 const rows = [base, other];
@@ -564,7 +614,7 @@ if (start < 0 || end < 0) throw new Error('model filter helpers not found');
 // rateCell/outCell 定义在切片之外（各管一个单元格），本测试只关心行内徽标/档位列，桩掉。
 const ctx = { Number, String, Array, Object, isFinite, parseFloat, esc: v => String(v == null ? '' : v), rateCell: () => '', outCell: () => '' };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue; this.mdRowHtml=mdRowHtml;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.mdMatch=mdMatch; this.mdSortList=mdSortList; this.mdRateValue=mdRateValue; this.mdRowHtml=mdRowHtml;', ctx);
 const models = [
   { id: 'cn:glm-5.2', name: 'GLM-5.2', vendor: 'Zhipu', tags: ['视觉'], supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: true, supported_efforts: ['high', 'xhigh'], default_effort: 'high', is_default: false, credits: '0.79', promo_factor: 0.5, promo_credits: '0.40', promo_label: '夜间折扣', context_length: 1000000, max_output_tokens: 131000 },
   { id: 'cn:hy3', name: 'Hy3', supports_tool_call: true, supports_images: true, supports_reasoning: true, can_disable_thinking: false, supported_efforts: ['low', 'high'], default_effort: 'high', is_default: false, credits: '0', promo_factor: 0, promo_credits: '0', promo_label: '限时免费', context_length: 192000, max_output_tokens: 64000 },
@@ -641,7 +691,7 @@ const end = src.indexOf('function mdRowHtml');
 if (start < 0 || end < 0) throw new Error('model availability helpers not found');
 const ctx = { esc: s => String(s) };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.mdAvailabilityOf=mdAvailabilityOf; this.mdAvailabilityTag=mdAvailabilityTag;', ctx);
 const model = id => ({ id });
 const state = (m, locks, recent) => ctx.mdAvailabilityOf(m, locks, recent).key;
 const success = [{ model: 'global:ok', status: 200, outcome: 'success', time: '2026-10-18T12:00:00Z' }];
@@ -703,7 +753,7 @@ const ctx = {
   $: () => host,
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(start, end) +
   '\nthis.renderUsageChart=renderUsageChart;', ctx);
 const series = [
   { t: '2026-09-30T09', scope: 'hour', prompt_tokens: 35, completion_tokens: 16, total_tokens: 51, requests: 1 },
@@ -770,7 +820,7 @@ const ctx = {
   esc: s => String(s == null ? '' : s),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) +
+vm.runInContext("'use strict';\n" + src.slice(start, end) +
   '\nthis.trangeState=trangeState; this.trangeQuery=trangeQuery; this.trangeLabel=trangeLabel; this.trangeMidnight=trangeMidnight;', ctx);
 const q = (preset, rolling) => {
   ctx.trangeState('t').preset = preset;
@@ -843,7 +893,7 @@ const end = src.indexOf('function renderPackages');
 if (start < 0 || end < 0) throw new Error('detail group functions not found');
 const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.pkDetailGroups = pkDetailGroups; this.pkDetailLimit = pkDetailLimit;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.pkDetailGroups = pkDetailGroups; this.pkDetailLimit = pkDetailLimit;', ctx);
 const input = [
   { id: 'small-late', size: 100, remain: 1, expires_at: 400 },
   { id: 'zero-early-b', size: 200, remain: 0, expires_at: 200 },
@@ -899,7 +949,7 @@ const end = src.indexOf('function renderExpiryDistribution');
 if (start < 0 || end < 0) throw new Error('expiry summary functions not found');
 const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.summarizeCreditDays = summarizeCreditDays; this.pkAccountColorMap = pkAccountColorMap;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.summarizeCreditDays = summarizeCreditDays; this.pkAccountColorMap = pkAccountColorMap;', ctx);
 const day = 86400000, now = 100000;
 const out = ctx.summarizeCreditDays([
   { uid: 'a', remain: 100, packages: [
@@ -1159,7 +1209,7 @@ const ctx = {
   $: id => (id === 'cfgForm' ? cfgForm : null),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
 const out = ctx.collectConfig();
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
 process.stdout.write(JSON.stringify([
@@ -1203,7 +1253,7 @@ const start = src.indexOf('function rateCell(');
 assert.ok(start >= 0, 'rateCell not found');
 const ctx = { String, Object, esc: v => String(v == null ? '' : v) };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, src.indexOf('async function loadModels(')) + '\nthis.rateCell = rateCell;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, src.indexOf('async function loadModels(')) + '\nthis.rateCell = rateCell;', ctx);
 // ① 无牌价 + 有实测 → 实测 0.55/张
 const a = ctx.rateCell({ credits: '', measured_credit: '0.55' });
 assert.ok(a.includes('实测 0.55/张'), 'want 实测 0.55/张, got: ' + a);
@@ -1243,7 +1293,7 @@ const st = { preset: '0', from: null, to: null };
 const ctx = { URLSearchParams, Date, Number, String, Object,
   trangeState: () => st, trangeMidnight: () => new Date('2026-10-06T00:00:00') };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, src.indexOf('function trangeLabel(')) + '\nthis.trangeQuery = trangeQuery;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, src.indexOf('function trangeLabel(')) + '\nthis.trangeQuery = trangeQuery;', ctx);
 // ① 用量（rolling）：「全部历史」→ hours=0
 st.preset = '0';
 assert.equal(ctx.trangeQuery('usRange', true).toString(), 'hours=0', '全部历史应发 hours=0');
@@ -1347,7 +1397,7 @@ const ctx = {
   startQueuePolling: () => calls.push('polling'),
 };
 vm.createContext(ctx);
-vm.runInContext('let queueTimer = null, lastQueueSeq = 0; let taskCenterOwner = "jobs";\n' +
+vm.runInContext("'use strict';\n" + 'let queueTimer = null, lastQueueSeq = 0; let taskCenterOwner = "jobs";\n' +
   src.slice(s, e) +
   '\nthis.setOwner = v => { taskCenterOwner = v; }; this.owner = () => taskCenterOwner;' +
   '\nthis.reattach = reattachQueueView;', ctx);
@@ -1412,7 +1462,7 @@ const ctx = {
   esc: (s) => String(s),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start) + '\nthis.loadPackages = loadPackages;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start) + '\nthis.loadPackages = loadPackages;', ctx);
 (async () => {
   await ctx.loadPackages();                       // 冷：首次进入 → 打上游
   const cold = { calls: calls.length, rendered: rendered.slice() };
@@ -1489,7 +1539,7 @@ const ctx = {
 vm.createContext(ctx);
 // 展开态恢复由 TestAppJSExpiryRestToggleSurvivesRerender 专测；本用例的 tbody 桩没有按钮，
 // applyRestToggle 用 querySelector 取不到按钮会直接返回，不影响渲染断言。
-vm.runInContext('const restOpen = Object.create(null);\n' +
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
   src.slice(start, end) + '\nthis.renderExpirySnapshot = renderExpirySnapshot;', ctx);
 const day = n => new Date(Date.now() + n * 86400000).toISOString();
 ctx.renderExpirySnapshot({ accounts: [
@@ -1557,7 +1607,7 @@ if (escStart < 0 || escEnd < 0) throw new Error('esc helpers not found');
 if (start < 0 || end < 0) throw new Error('remark helpers not found');
 const ctx = { String, RegExp, Number };
 vm.createContext(ctx);
-vm.runInContext(
+vm.runInContext("'use strict';\n" + 
   src.slice(escStart, escEnd) + src.slice(start, end) +
   '\nconst REM = {abcdef12: "JTOL", deadbeef: "<b>x</b>"};' +
   '\nfunction remarksAll() { return REM; }' +
@@ -1667,7 +1717,7 @@ const ctx = {
   api: async () => ({}),
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\n' + toggleSrc +
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\n' + toggleSrc +
   '\nthis.renderCompensation = renderCompensation; this.setData = (d) => { compData = d; };' +
   ' this.applyRestToggle = applyRestToggle; this.restOpen = restOpen;', ctx);
 
@@ -1846,7 +1896,7 @@ const bodies = { expBody: makeBody(7), compBody: makeBody(2) };
 const $ = id => bodies[id] || null;
 const ctx = { $ };
 vm.createContext(ctx);
-vm.runInContext('const restOpen = Object.create(null);\n' + src.slice(start, end) +
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' + src.slice(start, end) +
   '\nthis.restOpen = restOpen; this.applyRestToggle = applyRestToggle;', ctx);
 
 function click(body) {
@@ -1934,7 +1984,7 @@ const ctx = {
   outCell: () => '<td></td>',
 };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rowHtml = mdRowHtml;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rowHtml = mdRowHtml;', ctx);
 const base = { id: 'cn:glm-5.2', supported_efforts: [], image_generation: false };
 const out = {
   congested: ctx.rowHtml({ ...base, busy: 'congested' }, null),
@@ -1992,7 +2042,7 @@ const ctx = {
 ctx.$ = id => ctx[id];
 vm.createContext(ctx);
 // 展开态恢复另有专测；这里只断言快照/排序/兜底渲染（桩无按钮 → applyRestToggle 直接返回）。
-vm.runInContext('const restOpen = Object.create(null);\n' +
+vm.runInContext("'use strict';\n" + 'const restOpen = Object.create(null);\n' +
   src.slice(start, end) + '\nthis.renderExpirySnapshot=renderExpirySnapshot;', ctx);
 const day = n => {
   const d = new Date(Date.now() + n * 86400000);
@@ -2064,7 +2114,7 @@ const he = src.indexOf('/* usTabsHtml');
 if (hs < 0 || he < 0) throw new Error('usRow/usDimHead not found');
 const ctx = { Number, String, RegExp, Math, Array, Object };
 vm.createContext(ctx);
-vm.runInContext(
+vm.runInContext("'use strict';\n" + 
   src.slice(hs, he) +
   '\nconst esc = s => String(s);' +
   '\nconst fmtTok = n => String(n);' +
