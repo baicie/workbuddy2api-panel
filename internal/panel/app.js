@@ -8,6 +8,9 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
+/* 重新登录上下文（复用 #addVeil 弹窗）：null = 添加账号模式；非 null = 账号原位重新授权模式。
+   放在文件顶部与 loginState 相邻，避免渲染 / 弹窗函数早于声明执行时踩 TDZ。 */
+let reloginCtx = null;
 let refTimer = null;
 /* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
 let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
@@ -72,7 +75,10 @@ async function api(path, opts = {}) {
   // （登录轮询据此决定继续等 OAuth 还是提示重新发起）。
   if (r.status === 401) { openKey(); const e = new Error('密钥无效或未填写'); e.status = 401; throw e; }
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+  // 4xx/5xx：message 是后端给的人话（新接口同时回 error 机器码 + message，如 relogin 的
+  // uid/realm mismatch）；既有接口响应体只有 error 键，故 d.message 前置不改变任何既有文案。
+  // body 一并挂到错误上：调用方需要机器码/细节时读 e.body，不必再去猜 message 字符串。
+  if (!r.ok) { const e = new Error(d.message || d.error || ('HTTP ' + r.status)); e.status = r.status; e.body = d; throw e; }
   return d;
 }
 function toast(msg, cls) {
@@ -421,7 +427,16 @@ function renderAccounts(list) {
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    // 认证故障（后端 needs_relogin = disabled && auth_fault != ""）：上游已判死登录凭据。
+    // 与普通「已禁用」分开显示——这是可原地修复的状态，给醒目标签 + 主色重登按钮。
+    if (s.needs_relogin) {
+      const why = s.auth_fault === 'gateway_401' ? '网关 401（invalid_token）：access token 已被上游拒绝'
+        : s.auth_fault === 'session_dead' ? '上游判定会话失效（12153 / refresh offline）'
+        : '上游判定登录凭据失效';
+      cls = 'off';
+      tag = '<span class="tag bad" title="' + esc(why + '；点「重新登录」原位重新授权，不必移除账号') + '">需重新授权</span>';
+    }
+    else if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     // 暂停选号：与禁用同属「不可选」，但照常保号（吸收上游 fd835df）
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
@@ -461,6 +476,12 @@ function renderAccounts(list) {
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
     const frozen = s.disabled || cool > 0;
+    // 重登入口（排在最左、主色）：静态 API Key 账号没有可刷新的 OAuth 凭据
+    // （后端 relogin/start 直接回 400 static_api_key_account），一律不给；
+    // needs_relogin 是后端结论（disabled && auth_fault != ""）；
+    // session_dead_fails > 0 且未禁用是「上游已判死、号还在池里」的中间态，同样需要原位重登。
+    // 判定内联在这里：本函数会被既有测试整块切出来在 vm 里执行，不能引用切片外的 helper。
+    const offerRelogin = !s.api_key && (s.needs_relogin === true || ((s.session_dead_fails || 0) > 0 && !s.disabled));
     // 无个人成长体系的账号（企业版 / 静态 API Key）：签到与成长任务端点在上游对自己
     // 恒失败，按钮点了只会报错，故不渲染；「额度」按钮走企业口径端点照常可用。
     const personal = !(s.enterprise || s.api_key);
@@ -486,6 +507,8 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
+        (offerRelogin ?
+          '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="用浏览器重新登录该账号：只替换登录凭据，不新建账号、不改积分与冷却">重新登录</button>' : '') +
         // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
         // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
         // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
@@ -567,6 +590,8 @@ $('accBody').addEventListener('click', async ev => {
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
+  // 重新登录只是打开弹窗（纯本地动作）：提前返回，免得走下面的按钮 disable 复位与整表重载。
+  if (a === 'relogin') { openRelogin(u); return; }
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -1419,8 +1444,15 @@ $('cfgForm').onsubmit = async ev => {
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
 
-/* ── 添加账号 ─────────────────────────────────────────────────────── */
+/* ── 添加账号 / 重新登录（同一个弹窗，两种模式）──────────────────────── */
+/* 弹窗会话代次：每次打开 / 关闭都 +1。closeAdd 里的 login/cancel 是异步的，收尾前要核代次
+   ——否则「关闭 A 弹窗 → 立刻打开 B 弹窗」时，A 的取消回调会把 B 的界面复位/关掉。 */
+let addDlgGen = 0;
 function openAdd() {
+  addDlgGen++;
+  reloginCtx = null;            // 从重登模式回来：先清上下文，保证添加流程状态全复位
+  loginState = null;            // 丢弃可能残留的会话（例如上次关闭因 409 未取消成功）
+  applyAddMode('add');
   $('addVeil').classList.add('on');
   // 重置到登录标签
   switchAddTab('login');
@@ -1433,6 +1465,37 @@ function openAdd() {
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   $('btnAddApiKey').hidden = true;
   stopPoll();
+}
+/* 弹窗双模式：add（原有添加账号流程）/ relogin（账号原位重新授权）。
+   只切标题、标签页可见性、锁定信息块与页脚文案；链接展示 / 轮询 / 成功失败提示全部复用。 */
+function applyAddMode(mode) {
+  const rl = mode === 'relogin';
+  $('addTitle').textContent = rl ? '重新登录账号' : '添加账号';
+  $('addTabs').hidden = rl;      // 重登期间不能切到「导入 JSON / API Key」
+  $('addPick').hidden = rl;      // 版本由后端按账号现有记录锁定，不可选
+  $('addRelogin').hidden = !rl;
+  $('btnStartLogin').textContent = rl ? '获取重新授权链接' : '获取授权链接';
+  $('btnCloseAdd').textContent = rl ? '取消' : '关闭';
+  $('addPoll').innerHTML = rl
+    ? '<span class="dots">等待重新授权完成，自动检测中</span>'
+    : '<span class="dots">等待授权完成，自动检测中</span>';
+}
+/* 从账号行进入重登模式：先复用 openAdd() 做一次完整复位（状态块全隐藏、轮询停掉、模式切
+   回 add），再切到锁定目标账号的形态——避免上一次添加流程的链接 / 报错残留。 */
+function openRelogin(uid) {
+  const acc = ((overviewData && overviewData.accounts) || []).find(x => x.uid === uid) || {};
+  openAdd();
+  reloginCtx = {
+    uid: uid,
+    nickname: acc.nickname || '',
+    realm: acc.realm === 'global' ? 'global' : 'cn',
+    state: null,
+  };
+  applyAddMode('relogin');
+  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  $('addRlNick').textContent = reloginCtx.nickname || '未命名';
+  $('addRlUid').textContent = uid;
+  $('addRlRealm').textContent = reloginRealmText(reloginCtx.realm);
 }
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
@@ -1447,6 +1510,8 @@ document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
 });
 function startAddLogin() {
+  // 重登模式下同一个按钮：走账号原位重新授权（uid 走路径，realm 由服务端按现有账号推导）。
+  if (reloginCtx) return startRelogin();
   const realm = (document.querySelector('input[name="addRealm"]:checked') || {}).value || 'cn';
   $('btnStartLogin').disabled = true;
   $('addLoad').hidden = false; $('addErr').hidden = true;
@@ -1466,31 +1531,111 @@ function startAddLogin() {
     $('addErr').textContent = e.message;
   });
 }
+
+/* relogin/start：uid 走路径，realm 由服务端按账号现有记录推导，前端只发空 body（不接受指定）。 */
+function startRelogin() {
+  const ctx = reloginCtx;
+  if (!ctx) return;
+  $('btnStartLogin').disabled = true;
+  $('addLoad').hidden = false; $('addErr').hidden = true; $('addDone').hidden = true;
+  api('accounts/' + encodeURIComponent(ctx.uid) + '/relogin/start', { method: 'POST', body: '{}' }).then(r => {
+    if (!reloginCtx || reloginCtx.uid !== ctx.uid) return;   // 期间已关闭 / 换目标：丢弃结果
+    loginState = r.state;
+    reloginCtx.state = r.state;
+    if (r.nickname) { reloginCtx.nickname = r.nickname; $('addRlNick').textContent = r.nickname; }
+    if (r.realm === 'cn' || r.realm === 'global') {
+      reloginCtx.realm = r.realm;
+      $('addRlRealm').textContent = reloginRealmText(r.realm);
+    }
+    $('addUrl').textContent = r.url;
+    $('addLoad').hidden = true; $('addReady').hidden = false;
+    $('btnStartLogin').hidden = true;
+    $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
+    pollFails = 0;
+    loginTimer = setInterval(pollLogin, 3000);
+  }).catch(e => {
+    if (!reloginCtx || reloginCtx.uid !== ctx.uid) return;
+    $('addLoad').hidden = true;
+    $('btnStartLogin').disabled = false;
+    $('addErr').hidden = false;
+    $('addErr').textContent = reloginStartErrMsg(e);
+  });
+}
+function reloginRealmText(realm) { return realm === 'global' ? '国际版（Global）' : '国内版（CN）'; }
+/* 后端的 4xx 同时回 error（机器码）+ message（人话）：优先展示人话，机器码只用来分支。
+   终态提示必须说清「账号没有被改动」，不许留下成功暗示。 */
+function reloginStartErrMsg(e) {
+  const code = (e && e.body && e.body.error) || '';
+  const detail = (e && e.body && e.body.message) || (e && e.message) || '未知错误';
+  if (code === 'static_api_key_account') return '该账号是静态 API Key，不支持 OAuth 重新登录；Key 失效请在「添加账号 → API Key」里重新添加。';
+  if (code === 'relogin_in_progress') return '该账号已有进行中的重新登录：请先在已打开的浏览器页里完成授权，或稍后重试。';
+  if (code === 'relogin_target_missing' || (e && e.status === 404)) return '目标账号已不在池中（可能刚被移除），请关闭后刷新列表。';
+  if (code === 'login_processing') return '服务端正在写入上一次授权的凭据，请稍候几秒再试。';
+  if (e && e.status === 410) return '重新授权会话已过期，请重新发起。';
+  return '获取重新授权链接失败：' + detail;
+}
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
 // pollFails 连续查询失败计数：网络抖动不该让用户以为「重新登录没用」。OAuth 可能已经在
 // 浏览器侧完成，只是这次没收到结果——停掉轮询账号就永远不入池。
 let pollFails = 0;
 const POLL_MAX_FAILS = 20;
 async function pollLogin() {
-  if (!loginState) return;
+  const st = loginState;                 // 快照：await 期间会话可能被关闭 / 重置
+  if (!st) return;
   try {
-    const r = await api('login/poll?state=' + encodeURIComponent(loginState));
+    const r = await api('login/poll?state=' + encodeURIComponent(st));
+    if (loginState !== st) return;       // 已关闭或换了会话：丢弃这次结果，避免写串界面
     pollFails = 0;
     if (r.done) {
       stopPoll();
+      loginState = null;                 // 会话已终结：关闭弹窗时不必再 cancel
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
+      // 重登成功 = 原位换凭据：不能说「已添加」（只有新账号才走保号任务）。
+      // balance_ok === false 仍代表「重新授权成功」，只是计费通道暂时不可用
+      // （Billing 401 不等于 Chat 不可用，本项目既有结论），故只提示、不判失败。
+      // credits === -1 = 余额未知/未查到，不能显示成 0。
+      if (r.mode === 'relogin' || r.relogin === true) {
+        const bal = (r.balance_ok === false || r.balance_error)
+          ? '；余额校验未通过：' + (r.balance_error || '未知原因') + '（Chat 可能仍可用；授权已生效，稍后点「余额」可重试）'
+          : '';
+        $('addDone').textContent = '已重新授权，账号已恢复：' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + bal;
+      } else {
+        const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
+        $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
+      }
       invalidatePackages(); // 凭据换新：缓存里的旧 401 行必须作废
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
+    if (loginState !== st) return;
+    // 终态只停轮询、不主动清 loginState：既有轮询语义（连续 poll 共用同一 state）不变，
+    // 关闭弹窗时由 closeAdd 发 login/cancel 收尾（已作废的 state 会回 404/410，照常关闭）。
+    const code = (e.body && e.body.error) || '';
+    const detail = (e.body && e.body.message) || e.message;
+    // 409 里只有 login_processing 还能继续等（服务端正在写凭据）；其余（uid / realm 与目标
+    // 不一致、目标账号已不存在）是终态：后端已拒绝写入，必须明确说出失败，绝不能被当成成功。
+    if (e.status === 409 && code !== 'login_processing') {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addErr').hidden = false;
+      if (code === 'relogin_uid_mismatch') {
+        $('addErr').textContent = '授权结果属于另一个账号，已拒绝覆盖原凭据（账号未被改动）。请在浏览器里退出当前账号、确认登录的是目标账号后重新发起。';
+      } else if (code === 'relogin_realm_mismatch') {
+        $('addErr').textContent = '授权结果的版本（CN / Global）与目标账号不一致，已拒绝覆盖原凭据（账号未被改动）。请用对应版本的账号登录后重新发起。';
+      } else if (code === 'relogin_target_missing') {
+        $('addErr').textContent = '目标账号已不存在（可能刚被移除），这次重新登录已取消，不会新建账号。';
+      } else {
+        $('addErr').textContent = '登录轮询被拒绝：' + detail + '；账号未被改动。';
+      }
+      return;
+    }
     if (e.status === 404 || e.status === 410) {
       stopPoll();
       $('addReady').hidden = true;
       $('addErr').hidden = false;
-      $('addErr').textContent = '登录会话已过期，请关闭后重新添加';
+      // 添加 / 重登共用一句：会话作废，重新发起即可（重登时账号本身没有被改动）。
+      $('addErr').textContent = '登录会话已过期（有效 15 分钟），请重新发起；账号未被改动。';
       return;
     }
     pollFails++;
@@ -1498,14 +1643,41 @@ async function pollLogin() {
       stopPoll();
       $('addReady').hidden = true;
       $('addErr').hidden = false;
-      $('addErr').textContent = '连续 ' + POLL_MAX_FAILS + ' 次查询失败，已停止轮询：' + e.message + '（授权可能已完成，可关闭后重新添加）';
+      $('addErr').textContent = '连续 ' + POLL_MAX_FAILS + ' 次查询失败，已停止轮询：' + detail + '（授权可能已完成，可关闭后刷新列表确认）';
       return;
     }
     $('addErr').hidden = false;
-    $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + e.message;
+    $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + detail;
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+/* 关闭弹窗：清上下文 + 复位成添加模式。若还有在途会话，顺手调 login/cancel 让服务端立刻
+   收回 state（比等 15 分钟 TTL 干净）。409 login_processing = 服务端正在把凭据写盘，
+   此时关掉会让人误以为「已取消」，故保留弹窗并提示稍候。 */
+function closeAdd() {
+  const st = loginState;
+  const gen = ++addDlgGen;    // 本次关闭的代次：异步收尾前先核对，别踩到之后新开的弹窗
+  stopPoll();
+  if (!st) { resetAddDialog(); return; }
+  loginState = null;
+  api('login/cancel', { method: 'POST', body: JSON.stringify({ state: st }) })
+    .catch(e => e)              // 404/410/网络错误都当「已经没了」，照常关闭
+    .then(e => {
+      if (gen !== addDlgGen) return;   // 期间已重新打开弹窗：不要用旧关闭动作收尾
+      const code = (e && e.body && e.body.error) || '';
+      if (e && e.status === 409 && code === 'login_processing') {
+        loginState = st;        // 会话仍在写盘：恢复在途状态，稍候再关
+        toast('服务端正在写入凭据，请稍候再关闭弹窗', 'warn');
+        return;
+      }
+      resetAddDialog();
+    });
+}
+/* 关闭收尾的唯一出口：清重登上下文、弹窗外观复位成添加模式、隐藏遮罩。 */
+function resetAddDialog() {
+  reloginCtx = null;
+  applyAddMode('add');
+  $('addVeil').classList.remove('on');
+}
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 

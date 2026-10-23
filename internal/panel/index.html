@@ -396,6 +396,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
 }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+/* warn 用于「不是错误、但需要等一下」的提示（关闭弹窗时服务端正写凭据 → login_processing）。 */
+.tst.warn { border-left-color: var(--warn); }
 
 /* 手机版（≤760px）：导航 = 左侧抽屉（桌面隐藏） */
 #btnNav { display: none; }
@@ -1469,7 +1471,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="veil" id="addVeil">
   <div class="dlg">
     <header>
-      <h3>添加账号</h3>
+      <h3 id="addTitle">添加账号</h3>
       <div class="tabs" id="addTabs">
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
@@ -1479,6 +1481,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <div class="body">
       <!-- 浏览器登录 -->
       <div id="addTabLogin" class="tab-panel">
+        <!-- 重新登录模式（由账号行「重新登录」进入）：目标账号与版本由后端按账号现有记录锁定，
+             这里只展示、不可改。弹窗其余部分（链接 / 轮询 / 成功 / 失败）与添加账号完全复用。
+             注意：#addRelogin 自身不写 inline display —— 内联样式会盖掉 [hidden] 的 display:none。 -->
+        <div id="addRelogin" hidden>
+          <div class="hint" style="font-size:12px;color:var(--ink-3);margin-bottom:8px">重新授权只替换该账号的登录凭据，积分 / 冷却 / 选号状态保持不变。</div>
+          <div style="display:flex;flex-wrap:wrap;gap:22px;padding:10px 12px;margin-bottom:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)">
+            <div><div class="hint" style="font-size:11px;color:var(--ink-3)">账号</div><div id="addRlNick" style="font-weight:600"></div></div>
+            <div><div class="hint" style="font-size:11px;color:var(--ink-3)">uid</div><div id="addRlUid" style="font-family:var(--mono);font-size:12px"></div></div>
+            <div><div class="hint" style="font-size:11px;color:var(--ink-3)">版本（不可切换）</div><div id="addRlRealm"></div></div>
+          </div>
+        </div>
         <div id="addPick">
           <div class="realm-row">
             <span class="hint" style="font-size:12px">版本：</span>
