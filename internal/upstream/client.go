@@ -1149,19 +1149,18 @@ func (c *Client) RefreshTokenIfNeeded(a *auth.Auth, within time.Duration) error 
 }
 
 // refresh 刷新事务编排：
-//  1. 取 RT/AT 快照（a.mu 内，短）；
+//  1. 取「代次 + RT/AT」快照（a.mu 内，短）；
 //  2. 按 RT 查 60s 宽限结果 → 命中直接合并；
 //  3. 同 RT 已有在途刷新 → 等它，不重复发请求；
 //  4. 否则作为 leader 锁外发 HTTP，完成后把结果交给等待者并缓存 60s；
-//  5. 写回前双检 token 是否已被别人换新；失败时同样先判断，避免把
+//  5. 写回前双检 token/代次是否已被别人换新；失败时同样先判断，避免把
 //     「并发落败」误判成 12153 session dead。
 //
 // 锁序：refreshMu → a.mu；网络 I/O 不持任何锁。
 func (c *Client) refresh(a *auth.Auth, within time.Duration, force bool) error {
-	a.Lock()
-	rtSnapshot := a.RefreshToken
-	atBefore := a.AccessToken
-	a.Unlock()
+	// 一次锁内读齐三元组：分开读会在「读代次」与「读 token」之间插入一次整体替换
+	// （401 账号重新登录），代次校验随即失效。详见 auth.Auth.RefreshSnapshot。
+	epochBefore, atBefore, rtSnapshot := a.RefreshSnapshot()
 	if strings.TrimSpace(rtSnapshot) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
@@ -1186,13 +1185,13 @@ func (c *Client) refresh(a *auth.Auth, within time.Duration, force bool) error {
 		if r, ok := c.renewed[key]; ok && time.Since(r.at) < refreshGrace {
 			c.refreshMu.Unlock()
 			log.Printf("refresh %s: reuse result within %s", logfmt.Label(a.UID, a.Nickname), refreshGrace)
-			return c.applyRefresh(a, r, atBefore, rtSnapshot)
+			return c.applyRefresh(a, r, atBefore, rtSnapshot, epochBefore)
 		}
 	}
 	if call, ok := c.refreshing[key]; ok {
 		c.refreshMu.Unlock()
 		<-call.done
-		return c.applyRefresh(a, call.res, atBefore, rtSnapshot)
+		return c.applyRefresh(a, call.res, atBefore, rtSnapshot, epochBefore)
 	}
 	call := &refreshCall{done: make(chan struct{})}
 	c.refreshing[key] = call
@@ -1222,7 +1221,7 @@ func (c *Client) refresh(a *auth.Auth, within time.Duration, force bool) error {
 
 	res := c.doRefresh(a, rtSnapshot)
 	finish(res)
-	return c.applyRefresh(a, res, atBefore, rtSnapshot)
+	return c.applyRefresh(a, res, atBefore, rtSnapshot, epochBefore)
 }
 
 // doRefresh 只做网络刷新，不写回。调用方已保证同一 RT 只有它一个 leader。
@@ -1288,21 +1287,37 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 // applyRefresh 把刷新结果合并回 a。写回前重新校验快照（AND 语义，与旧实现一致）：
 // 锁外期间另一刷新已完成 → 两 token 必同时变化，本次结果不必再写；失败时同样
 // 先看 token 是否已变——变了说明别人刷成功，本次失败只是并发落败，不该禁用账号。
-func (c *Client) applyRefresh(a *auth.Auth, r *refreshResult, atBefore, rtSnapshot string) error {
+//
+// epochBefore 是本次刷新**发起时**的凭证代次（见 auth.Auth.RefreshSnapshot）。
+// 代次已变 = 锁外期间该账号被整体替换过凭据（401 重新登录走 AdoptCredentials）：
+// 本次结果（无论成功失败）都是拿旧 RefreshToken 换来的，对当前凭据无意义，
+// 一律丢弃 ——
+//   - 成功结果照写，会把刚落盘的新授权凭证覆盖回旧凭证，重登录等于白做；
+//   - 失败结果照判（12153 session dead），会把刚恢复的账号再判一次死（误杀）。
+//
+// 两种都必须返回 nil（= 本次刷新不算失败），调用方才不会禁用/冷却账号。
+func (c *Client) applyRefresh(a *auth.Auth, r *refreshResult, atBefore, rtSnapshot string, epochBefore uint64) error {
 	if r == nil {
 		return fmt.Errorf("refresh: no result")
 	}
 	if r.err != nil {
 		a.Lock()
+		superseded := a.EpochLocked() != epochBefore
 		changed := a.AccessToken != atBefore && a.RefreshToken != rtSnapshot
 		a.Unlock()
-		if changed {
+		if superseded || changed {
 			return nil
 		}
 		return r.err
 	}
 	a.Lock()
 	defer a.Unlock()
+	if a.EpochLocked() != epochBefore {
+		// 凭据已在锁外被整体替换：新授权优先，旧刷新结果作废（不写回）。
+		log.Printf("refresh %s: 凭据已被重新授权替换（代次 %d→%d），丢弃本次刷新结果",
+			logfmt.Label(a.UID, a.Nickname), epochBefore, a.EpochLocked())
+		return nil
+	}
 	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
 		return nil
 	}
@@ -1791,9 +1806,9 @@ type v3ModelPromotion struct {
 	// id+name+tags）。实测 2026-10-22：global 的 hy-image-3.5 只出现在这里、
 	// data.models 里没有——只按 models 解析会得出「国际版没有出图模型」的假
 	// 结论（实际可调：200 + usage{output_image_tokens:15000, credit:0.27}）。
-	ID   string   `json:"id"`
-	Name string   `json:"name"`
-	Tags []string `json:"tags"`
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Tags  []string `json:"tags"`
 	Badge *struct {
 		Label string `json:"label"`
 	} `json:"badge"`

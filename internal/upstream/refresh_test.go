@@ -203,13 +203,13 @@ func TestRefreshLoserNotSessionDead(t *testing.T) {
 		err: &Error{Kind: ErrSessionDead, Status: 401, Msg: "12153: refresh token is invalid"},
 		at:  time.Now(),
 	}
-	if err := c.applyRefresh(a, lost, "at", "r1"); err != nil {
+	if err := c.applyRefresh(a, lost, "at", "r1", a.Epoch()); err != nil {
 		t.Fatalf("concurrent loser must not surface session-dead: %v", err)
 	}
 
 	// 反例：token 没变时，真正的 12153 仍要透出。
 	b := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "r1"}
-	if err := c.applyRefresh(b, lost, "at", "r1"); err == nil {
+	if err := c.applyRefresh(b, lost, "at", "r1", b.Epoch()); err == nil {
 		t.Fatal("real session-dead must surface")
 	}
 }
