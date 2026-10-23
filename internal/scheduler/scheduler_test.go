@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -120,21 +122,41 @@ func TestRunCatchesUpMissedSlots(t *testing.T) {
 		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
 		BlackcatDisabled: true, GrowthDisabled: true,
 	})
-	old := wakeupGraceDelay
+	// 包级可变量（测试专用「可置 0」开关）必须**在 Run 退净之后**才恢复：
+	// Run 里补跑那一批是独立的 goroutine，它在 log.Printf / time.Now / 各任务族
+	// 里会继续读这些全局；「defer 恢复 + 不 join」就是 DATA RACE 的主因。
+	// t.Cleanup 在函数体（含下面的 join）之后执行，顺序天然正确。
+	oldGrace := wakeupGraceDelay
 	wakeupGraceDelay = 0 // 测试不等启动宽限
-	defer func() { wakeupGraceDelay = old }()
+	t.Cleanup(func() { wakeupGraceDelay = oldGrace })
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.Run(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.Run(ctx)
+	}()
 
 	// 补跑在 Run 进入主循环之前派发；命中即退出，不等固定时长。
 	deadline := time.Now().Add(10 * time.Second)
 	for f.checkinCalls.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
+	calls := f.checkinCalls.Load()
+
+	// 确定性 join（显式 cancel + <-done，不靠 defer）：Run 内部 runBatch 用 WaitGroup
+	// 等各任务族收尾（scheduler.go runBatch），所以 Run 返回即本批全部结束——
+	// 包括 runCheckin 末尾 RunStreakBonusNow → claimCompensationQuiet 里的 log.Printf
+	// （trace 显示它正是读 time.Now()/time.Local 的 goroutine）。join 之后本测试
+	// 不再启动任何并发读写，全局可变量的恢复因此无竞争。
 	cancel()
-	if n := f.checkinCalls.Load(); n == 0 {
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run 未在 ctx 取消后返回：后台 goroutine 泄漏会让全局可变量恢复与 log.Printf 并发（DATA RACE）")
+	}
+
+	if calls == 0 {
 		t.Fatal("启动补跑未触发签到（今天的时点已过，应补一轮）")
 	}
 }
@@ -821,13 +843,51 @@ func TestBlackcatEligibility(t *testing.T) {
 	}
 }
 
-// TestMissedSlotsIsHostTimezoneIndependent 把 time.Local 换成 UTC 再跑一遍启动补跑
-// 断言：排程的小时数按 CST 解释，CI runner 在 UTC，用宿主时钟取「上一小时」时
-// UTC 16:00 之后那个时点在 CST 还是未来，补跑不触发（binaries #317 实测）。
-// 钉住「取当前时刻必须走 cst.Now()」。
+// TestMissedSlotsIsHostTimezoneIndependent 启动补跑的小时数按 CST（上游自然日）解释，
+// 与宿主机时区无关：CI runner 在 UTC，UTC 16:00–23:59 期间用宿主钟点取「上一小时」，
+// 那个时点在 CST 还是未来，补跑不触发（binaries #317 实测）。钉住「取当前时刻必须走
+// cst.Now()」。
+//
+// 宿主时区是**进程级**参数，所以这里用子进程注入 TZ=UTC 来模拟 UTC runner，而不是像
+// 旧版那样改写包级 time.Local。旧写法本身就是 DATA RACE 的写方：被它复跑的那条用例
+// 会留下仍在跑批次的 Run goroutine，goroutine 里的 time.Now()（log.Printf 内部也读它）
+// 在测试体返回后继续读这个全局，而 defer 恢复是先于 join 执行的。子进程方案在父进程里
+// 零全局写，等价性不变：子进程的 time.Local 就是 UTC，被测用例原样执行。
 func TestMissedSlotsIsHostTimezoneIndependent(t *testing.T) {
-	old := time.Local
-	time.Local = time.UTC
-	defer func() { time.Local = old }()
-	TestRunCatchesUpMissedSlots(t)
+	if os.Getenv(schedUTCHostEnv) == "1" {
+		// 子进程分支：宿主时区必须是 UTC，否则 TZ 注入失效、本用例失去意义。
+		if _, off := time.Now().Zone(); off != 0 {
+			t.Fatalf("子进程宿主时区偏移 %d 秒，应为 UTC（TZ=UTC 注入失效）", off)
+		}
+		TestRunCatchesUpMissedSlots(t)
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("取测试二进制路径失败: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	// -test.run 精确匹配被测用例（子进程不会再进本函数：父进程才有 exec 分支，
+	// 且子进程带 schedUTCHostEnv=1）。
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestRunCatchesUpMissedSlots$", "-test.v", "-test.timeout=120s")
+	cmd.Env = append(os.Environ(), "TZ=UTC", schedUTCHostEnv+"=1",
+		// -race 二进制退出时 TSan 默认睡 atexit_sleep_ms=1000ms（GORACE 默认值），
+		// 子进程每轮白付 1s（-count=100 会到 105s）。子进程只跑一条自己 join 干净
+		// goroutine 的用例，退出期没有写方，关掉这段 sleep 不损失检测能力；调用方
+		// 原有的 GORACE 选项（halt_on_error / log_path 等）原样保留。
+		"GORACE="+os.Getenv("GORACE")+" atexit_sleep_ms=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("UTC 宿主子进程跑启动补跑失败（这正是 #317 的失败形态）: %v\n%s", err, out)
+	}
+	// 防止 -test.run 失配导致「子进程什么都没跑」也判绿。
+	if !strings.Contains(string(out), "--- PASS: TestRunCatchesUpMissedSlots") {
+		t.Fatalf("子进程没有真正执行被测用例（-test.run 失配？）输出:\n%s", out)
+	}
 }
+
+// schedUTCHostEnv 子进程「宿主时区=UTC」标记：父进程启动子进程时设置，子进程据此
+// 走「直接跑被测用例」分支，避免无限递归。
+const schedUTCHostEnv = "WB_SCHED_UTC_HOST_TEST"

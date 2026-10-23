@@ -15,11 +15,14 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 )
 
+// Disable 禁用账号（**管理员口径**）：cause 记为 DisableCauseAdmin，因此重新登录
+// 不会自动解除它（只能人工 revive）。上游风控用 DisableWithCause(..., DisableCauseUpstream)，
+// 认证失效用 DisableAuth。
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		p.disableLocked(e, reason)
+		p.applyDisableLocked(e, DisableCauseAdmin, reason)
 	}
 }
 
@@ -43,19 +46,8 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 // 链路，而实际是 token 被边缘判无效、只能重登。计数/阈值语义与 12153 完全共用
 // （同一个 sessionDeadFails 计数，成功即由 ClearSessionDead 清零）。
 func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return false
-	}
-	e.sessionDeadFails++
-	if e.sessionDeadFails < sessionDeadThreshold {
-		return false
-	}
-	e.sessionDeadFails = 0
-	p.disableLocked(e, reason)
-	return true
+	// 故障类型由 reason 细分（12153 vs 网关 401），计数/阈值语义不变。
+	return p.NoteSessionDeadFault(uid, authFaultForReason(reason), reason)
 }
 
 // ClearSessionDead 清连续 12153 计数——账号被证明未死的任何时刻调用：
@@ -79,6 +71,11 @@ func (p *Pool) ReviveDisabled(uid string) {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+		// 人工复活同样意味着「不再需要重登」，认证故障标记一并清（否则面板会
+		// 在已解冻的账号上继续显示"需重新授权"）。
+		e.authFault = AuthFaultNone
+		e.authFaultAt = time.Time{}
+		e.disabledCause = DisableCauseNone
 		p.dirty.Store(true)
 	}
 }
@@ -102,6 +99,9 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	e.authFault = AuthFaultNone // 解冻 = 人工判定该号可用，不再需要重登
+	e.authFaultAt = time.Time{}
+	e.disabledCause = DisableCauseNone
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
@@ -764,7 +764,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Share:                p.shareOf(uid),
 		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
 		SessionDeadFails:     e.sessionDeadFails,
+		AuthFault:            string(e.authFault),
+		AuthFaultAt:          e.authFaultAt,
 		Disabled:             e.disabled,
+		DisabledCause:        string(e.disabledCause),
 		Paused:               e.paused,
 		SuccessCount:         e.successCount,
 		ErrTotal:             e.errTotal,
@@ -781,6 +784,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		BreakerFails:         e.fails,
 		BreakerUntil:         e.breakerUntil,
 	}
+	// 「需要重新登录」= 因认证失效而被禁用。放在字面量之后而不是中间：在字面量里插一行
+	// 独立注释会打断 gofmt 的对齐组，把后面十几个字段的对齐整体改一遍，diff 噪声远大于
+	// 这一行本身（本仓要保持可被上游 rebase）。口径就这一处，前端不再自行拼条件。
+	// 判据是 DisabledCause 而不是 authFault：管理员禁用期间即使观测到 401，
+	// 也绝不能显示成「需重新登录」，更不允许重登录据此解禁。
+	st.NeedsRelogin = e.disabled && e.disabledCause == DisableCauseAuth
 	// Reason 只在冷却/禁用时透出（issue #171-1）：软冷却按墙钟恢复、到期不会清理字段
 	// （Cooldown/CooldownSoftRate 写、NoteSuccess 不碰），无条件透出会让面板把「可用」
 	// 和一周前的「429 rate limit」并排显示，分不清是历史残留还是当前限流。

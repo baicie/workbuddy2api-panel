@@ -142,13 +142,9 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.loginMu.Lock()
-	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
-	for s, sess := range p.logins {
-		if time.Since(sess.created) > loginTTL {
-			delete(p.logins, s)
-		}
-	}
-	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
+	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留（与重新登录共用同一回收口径）。
+	p.sweepExpiredLoginsLocked()
+	p.logins[st.State] = loginSession{created: time.Now(), realm: realm, mode: LoginModeAdd}
 	p.loginMu.Unlock()
 	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
@@ -163,6 +159,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	// TTL 检查：过期会话按"未知 state"处理（410）。此前只有 loginStart 会回收，
+	// 一个 15 分钟没人管的 state 在 poll 侧仍可成功建号/换凭据，与 loginTTL 的
+	// 承诺不一致——尤其重登场景，陈旧授权不该还能改凭据。
+	if known && loginSessionExpired(sess, time.Now()) {
+		delete(p.logins, state)
+		known = false
+	}
 	if known && sess.processing {
 		p.loginMu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "正在写入凭据…"})
@@ -198,23 +201,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 		return
 	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
+	var tok loginToken
 	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for login"})
 		return
 	}
 
 	// 完成：取 uid/nickname（失败不阻塞，仅缺展示名）。
-	var acct struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}
+	var acct loginAccount
 	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
@@ -227,6 +221,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	// UID 是腾讯侧账号标识，实测为 UUID（十六进制与连字符），故只放行 [A-Za-z0-9_-]。
 	if !validUID(acct.UID) {
 		writeErr(w, http.StatusBadGateway, "上游返回的 uid 含非法字符，拒绝落盘（防路径穿越）")
+		return
+	}
+
+	// 重新登录：身份/域校验通过后**原位**换凭据，绝不新增账号、绝不跑新账号初始化。
+	// 与下方添加账号路径的副作用完全不同，故在此分叉（详见 relogin.go）。
+	if sess.mode == LoginModeRelogin {
+		p.finishRelogin(w, state, sess, tok, acct)
 		return
 	}
 

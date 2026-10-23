@@ -1101,7 +1101,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+					// 刷新时就判死（refresh 令牌已失效）：只能重登，打类型化标记。
+					h.cfg.Pool.DisableAuth(acct.UID, "refresh session dead", pool.AuthFaultSessionDead)
 				} else {
 					h.cfg.Pool.NoteError(acct.UID)
 				}
@@ -1789,9 +1790,25 @@ func validUsageCredit(credit float64, present bool) bool {
 	return present && !math.IsNaN(credit) && !math.IsInf(credit, 0) && credit >= 0
 }
 
+// usageTotalTokensLimit token 计数的值域闸门上限（不含）：2^63。
+//
+// 为什么是 2^63 而不是 MaxInt64：float64 只有 52 位尾数，MaxInt64 = 2^63-1 在
+// float64 里根本不可精确表示——float64(math.MaxInt64) 会舍入回 2^63。于是
+// 「先 int(total) 再比 float64(parsed) != total」的 round-trip 校验在边界上必然
+// 失效：total = 2^63 越界转 int 是实现定义的（本平台饱和到 MaxInt64），
+// float64(MaxInt64) 又恰好舍回 2^63，两边相等 → 越界值被当成合法 token 数放行
+// （usage.credit=0 + total_tokens=2^63 能通过计费闸门，2^63 个 token 计进成本账本）。
+// 所以值域必须在**转换前**判定：严格小于 2^63 的 float64 整数值全都精确落进
+// int64（无实现定义行为），恰好 2^63 及以上一律拒绝。
+const usageTotalTokensLimit = float64(1 << 63) // 2^63，float64 可精确表示，故比较安全
+
 // parseUsageTotalTokens 只接受落在 int 范围的有限正整数（小数/越界/NaN 一律拒绝）。
 func parseUsageTotalTokens(total float64) (int, bool) {
 	if math.IsNaN(total) || math.IsInf(total, 0) || total <= 0 || math.Trunc(total) != total {
+		return 0, false
+	}
+	// 值域闸门在转换之前：越界转换是实现定义的，不能靠转换后的 round-trip 兜底。
+	if total >= usageTotalTokensLimit {
 		return 0, false
 	}
 	parsed := int(total)
@@ -1923,13 +1940,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		//     一次就禁会在上游抖一下时把整池打光（这个坑本项目踩过一次）。死号在阈值
 		//     内仍会被选中重试，但最多 3 次即出池，不再每请求刷 401。
 		if uerr != nil && upstream.IsGatewayUnauthorized(uerr.Status, body) {
-			if h.cfg.Pool.NoteSessionDeadWith(uid, gatewayUnauthorizedReason) {
+			// 显式标注类型化故障：面板据此区分「网关 401 判死」与「12153 判死」两种成因。
+			if h.cfg.Pool.NoteSessionDeadFault(uid, pool.AuthFaultGateway401, gatewayUnauthorizedReason) {
 				log.Printf("WARN: [server] 账号 %s 连续 %d 次网关 401（token 被上游判无效）→ 禁用，需重新登录",
 					logfmt.Label(uid, ""), pool.SessionDeadThreshold())
 			}
 			return
 		}
-		h.cfg.Pool.Disable(uid, "12153 session dead")
+		// 业务 12153：认证失效终态，打上类型化标记，面板/运维据此走「重新登录」而不是
+		// 盲目「解冻」（解冻会把管理员暂停等状态一起清掉，见 pool.ClearAuthFault）。
+		h.cfg.Pool.DisableAuth(uid, "12153 session dead", pool.AuthFaultSessionDead)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
@@ -1950,7 +1970,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 					"channel verification blocked (11-128 request illegal)")
 				return
 			}
-			h.cfg.Pool.Disable(uid, "account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
+			// 上游风控封禁：成因记为 upstream，与「认证失效」彻底分开——
+			// 重登录不会解除它（凭据换新也解不开封号），面板也不会显示「需重新登录」。
+			h.cfg.Pool.DisableWithCause(uid, pool.DisableCauseUpstream,
+				"account restricted by upstream (11140 request illegal); appeal in WorkBuddy (submit feedback) to lift the restriction")
 			return
 		}
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
