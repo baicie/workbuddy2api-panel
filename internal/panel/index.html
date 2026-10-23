@@ -361,6 +361,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 .state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
 .state.ok { color: var(--ok); } .state.err { color: var(--bad); }
+/* warn 档：授权换好了但账号没真的回到可选号（仍禁用 / 仍暂停 / 计费未验证）。
+   颜色必须与「彻底成功」区分开，否则绿勾会替一句「仍处于禁用状态」撒谎。 */
+.state.warn { color: var(--warn); }
 .dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
 @keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
 
@@ -1485,7 +1488,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
              这里只展示、不可改。弹窗其余部分（链接 / 轮询 / 成功 / 失败）与添加账号完全复用。
              注意：#addRelogin 自身不写 inline display —— 内联样式会盖掉 [hidden] 的 display:none。 -->
         <div id="addRelogin" hidden>
-          <div class="hint" style="font-size:12px;color:var(--ink-3);margin-bottom:8px">重新授权只替换该账号的登录凭据，积分 / 冷却 / 选号状态保持不变。</div>
+          <div class="hint" style="font-size:12px;color:var(--ink-3);margin-bottom:8px">重新授权只替换该账号的登录凭据（不新建账号，历史统计与路由偏好保留）。积分会重新查询刷新；禁用 / 暂停 / 冷却是否解除取决于真实状态，成功提示会逐项说明——Chat 本次不做探测，会明确标「未验证」。</div>
           <div style="display:flex;flex-wrap:wrap;gap:22px;padding:10px 12px;margin-bottom:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)">
             <div><div class="hint" style="font-size:11px;color:var(--ink-3)">账号</div><div id="addRlNick" style="font-weight:600"></div></div>
             <div><div class="hint" style="font-size:11px;color:var(--ink-3)">uid</div><div id="addRlUid" style="font-family:var(--mono);font-size:12px"></div></div>

@@ -427,16 +427,30 @@ function renderAccounts(list) {
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
-    // 认证故障（后端 needs_relogin = disabled && auth_fault != ""）：上游已判死登录凭据。
+    // 禁用成因（disabled_cause）决定「重登能不能修」：只有 auth（登录凭据坏了）能靠原位
+    // 重新授权恢复；admin（人工禁用）/ upstream（上游风控封禁）换一次凭据也解不开，给它们
+    // 挂「需重新授权」+ 重登按钮只会把人引向注定白跑一趟的 OAuth。后端 needs_relogin 已按
+    // disabled_cause === "auth" 收窄，这里再判一次是双保险（防旧后端 / 字段名漂移）。
+    // 判定内联：本函数会被既有测试整块切出来在 vm 里执行，不能引用切片外的 helper。
+    const cause = s.disabled_cause || '';
+    const authFixable = cause !== 'admin' && cause !== 'upstream';
+    // 认证故障（后端 needs_relogin = disabled && disabled_cause == "auth"）：上游已判死登录凭据。
     // 与普通「已禁用」分开显示——这是可原地修复的状态，给醒目标签 + 主色重登按钮。
-    if (s.needs_relogin) {
+    if (s.needs_relogin && authFixable) {
       const why = s.auth_fault === 'gateway_401' ? '网关 401（invalid_token）：access token 已被上游拒绝'
         : s.auth_fault === 'session_dead' ? '上游判定会话失效（12153 / refresh offline）'
         : '上游判定登录凭据失效';
       cls = 'off';
       tag = '<span class="tag bad" title="' + esc(why + '；点「重新登录」原位重新授权，不必移除账号') + '">需重新授权</span>';
     }
-    else if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    else if (s.disabled) {
+      cls = 'off';
+      // 禁用成因给出处：否则运维会反复点「解冻 / 重新登录」猜为什么解不开。
+      const why = cause === 'admin' ? '管理员禁用：重新登录换凭据不会解除，确认后点「解冻」'
+        : cause === 'upstream' ? '上游风控封禁（如 11140）：重新登录也解不开，需上游侧恢复后点「解冻」'
+        : '';
+      tag = '<span class="tag bad"' + (why ? ' title="' + esc(why) + '"' : '') + '>已禁用</span>';
+    }
     // 暂停选号：与禁用同属「不可选」，但照常保号（吸收上游 fd835df）
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
@@ -478,10 +492,11 @@ function renderAccounts(list) {
     const frozen = s.disabled || cool > 0;
     // 重登入口（排在最左、主色）：静态 API Key 账号没有可刷新的 OAuth 凭据
     // （后端 relogin/start 直接回 400 static_api_key_account），一律不给；
-    // needs_relogin 是后端结论（disabled && auth_fault != ""）；
+    // needs_relogin 是后端结论（disabled && disabled_cause == "auth"）；
     // session_dead_fails > 0 且未禁用是「上游已判死、号还在池里」的中间态，同样需要原位重登。
+    // authFixable 再挡一次 admin / upstream 禁用：重登解不开，不该给这个入口。
     // 判定内联在这里：本函数会被既有测试整块切出来在 vm 里执行，不能引用切片外的 helper。
-    const offerRelogin = !s.api_key && (s.needs_relogin === true || ((s.session_dead_fails || 0) > 0 && !s.disabled));
+    const offerRelogin = !s.api_key && authFixable && (s.needs_relogin === true || ((s.session_dead_fails || 0) > 0 && !s.disabled));
     // 无个人成长体系的账号（企业版 / 静态 API Key）：签到与成长任务端点在上游对自己
     // 恒失败，按钮点了只会报错，故不渲染；「额度」按钮走企业口径端点照常可用。
     const personal = !(s.enterprise || s.api_key);
@@ -508,7 +523,7 @@ function renderAccounts(list) {
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         (offerRelogin ?
-          '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="用浏览器重新登录该账号：只替换登录凭据，不新建账号、不改积分与冷却">重新登录</button>' : '') +
+          '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="用浏览器重新登录该账号：只替换登录凭据，不新建账号；积分会重新查询刷新">重新登录</button>' : '') +
         // 无个人成长体系的账号（企业版 / 静态 API Key）不渲染「签到」「任务」：前者
         // 上游 400「企业账号不支持该操作」，后者 403 growth-only；只留「额度」，点它走
         // /balance，额度由 upstream 的企业口径端点（get-enterprise-user-usage）填充。
@@ -1484,6 +1499,14 @@ function applyAddMode(mode) {
    回 add），再切到锁定目标账号的形态——避免上一次添加流程的链接 / 报错残留。 */
 function openRelogin(uid) {
   const acc = ((overviewData && overviewData.accounts) || []).find(x => x.uid === uid) || {};
+  // 账号行已按 disabled_cause 收口（admin / upstream 不给重登按钮），这里再挡一次：
+  // overviewData 可能是上次刷新的旧快照，按钮与实际成因之间总有时间窗，别白跑一趟 OAuth。
+  if (acc.disabled_cause === 'admin' || acc.disabled_cause === 'upstream') {
+    toast(acc.disabled_cause === 'admin'
+      ? '该账号被管理员禁用，重新登录换凭据不会解除，确认后请在账号行点「解冻」'
+      : '该账号被上游风控封禁，重新登录也解不开，需上游侧恢复后再点「解冻」', 'warn');
+    return;
+  }
   openAdd();
   reloginCtx = {
     uid: uid,
@@ -1523,6 +1546,7 @@ function startAddLogin() {
     $('btnStartLogin').hidden = true;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
     pollFails = 0;
+  pollMode = 'add';                      // 轮询失败时要按「添加」口吻说（不承诺账号仍在）
   loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
     $('addLoad').hidden = true;
@@ -1552,6 +1576,7 @@ function startRelogin() {
     $('btnStartLogin').hidden = true;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
     pollFails = 0;
+    pollMode = 'relogin';                // 重登失败必须说清「原凭证仍在、账号没被改动」
     loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
     if (!reloginCtx || reloginCtx.uid !== ctx.uid) return;
@@ -1579,6 +1604,57 @@ function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = 
 // 浏览器侧完成，只是这次没收到结果——停掉轮询账号就永远不入池。
 let pollFails = 0;
 const POLL_MAX_FAILS = 20;
+// pollMode 这一次轮询是「添加账号」还是「重新登录」：两者失败时的分寸不同（重登失败要
+// 强调原凭证仍在、账号没被改动），而错误响应体里没有 mode，只能由发起方记下来。
+// 声明在 stopPoll→closeAdd 这段里（既有测试按这个区间切片执行 pollLogin），startAddLogin /
+// startRelogin 在切片外赋值是安全的：按点击时刻写入，那时整份脚本早求值完了。
+let pollMode = 'add';
+
+// reloginDoneText 重新登录成功文案：按后端回报的「分阶段状态」逐档映射，绝不合并成一句
+// 「账号已恢复」。为什么必须拆：授权成功只代表 OAuth 走完——账号可能仍被管理员/上游禁用、
+// 仍暂停选号、仍在冷却/熔断，Chat 后端更从未探测过；把这些说成「已恢复」会让运维按
+// 「能接单了」去排故障，比不提示更糟（后端 relogin.go finishRelogin 正是为此拆字段）。
+// 定义在本区间内：pollLogin 会被 login_poll_test 整块切片执行，不能引用切片外的新标识符。
+function reloginDoneText(r) {
+  let head;
+  if (r.credentials_updated !== true) {
+    // 200 却没确认换凭据（旧后端 / 字段漂移）：只敢报「流程走完」，绝不报「已恢复」。
+    head = '授权流程已完成，但服务端未确认凭据已更新，账号状态以列表为准';
+  } else if (r.recovered === true && r.in_rotation === true) {
+    head = '已重新授权，账号已恢复参与选号';
+  } else if (r.recovered === true && r.in_rotation !== true && r.paused === true) {
+    head = '已重新授权，但账号仍处于暂停选号（签到/保活照常，不接流量）';
+  } else if (r.recovered === true && r.in_rotation !== true && r.cooling === true) {
+    head = '已重新授权，但账号仍在冷却/熔断中，恢复后自动回池';
+  } else if (r.recovered !== true && r.disabled === true) {
+    // 换了凭据但禁用没解除（管理员 / 上游风控禁用）：说「已恢复」就是撒谎。
+    head = '已重新授权（凭证已更新），但账号仍处于禁用状态，需人工解冻';
+  } else if (r.recovered === true) {
+    // 认证故障解了却没回到选号、也不是暂停/冷却：状态自相矛盾时就说不确定，别硬猜。
+    head = '已重新授权，认证故障已解除，但账号当前未参与选号，请刷新列表核对';
+  } else {
+    // recovered=false 的正常情形（账号本来没被禁用）：凭证换新即可，可用性看列表。
+    head = '已重新授权（凭证已更新），账号可用性以列表状态为准';
+  }
+  // 身份写清楚：让人确认换的是目标账号（uid 兜底，重登必然有 uid）。
+  let out = head + '：' + (r.nickname || r.uid || '该账号') + (r.realm === 'global' ? '（国际版）' : '');
+  // 积分与添加账号同形；credits=-1 是「未知 / 未查到」，绝不能显示成 0。
+  out += (typeof r.credits === 'number' && r.credits >= 0)
+    ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '')
+    : ' · 积分未知（未查到，稍后点「余额」可重试）';
+  // Chat 后端不做任何探测：只能写「未验证」，写「Chat 正常」就是伪造健康结论。
+  out += r.chat_verified === true ? '；Chat 已验证' : '；Chat 未验证';
+  // 计费通道单独求证：401 只说明 Billing 不可用，既不否定 Chat，也不否定本次授权。
+  if (r.billing_verified === false || r.balance_ok === false) {
+    out += '；计费通道未验证通过：' + (r.balance_error || '未知原因') + '（不代表 Chat 不可用，稍后点「余额」可重试）';
+  }
+  // 运行状态没落盘不影响本次授权（凭据已 fsync），但必须说清重启会自己校正。
+  if (r.state_persisted === false) {
+    out += '；运行状态尚未落盘，重启后会自动校正（不影响本次授权）';
+  }
+  return out;
+}
+
 async function pollLogin() {
   const st = loginState;                 // 快照：await 期间会话可能被关闭 / 重置
   if (!st) return;
@@ -1590,22 +1666,30 @@ async function pollLogin() {
       stopPoll();
       loginState = null;                 // 会话已终结：关闭弹窗时不必再 cancel
       $('addReady').hidden = true;
+      $('addErr').hidden = true;
       $('addDone').hidden = false;
+      // 自动关闭的停留时间：真回到选号 1.6s 够用；「仍禁用 / 仍暂停 / 计费未验证」要人看清
+      // 并处理，一闪而过等于没提示（弹窗一关就只剩列表状态了）。
+      let linger = 1600;
       // 重登成功 = 原位换凭据：不能说「已添加」（只有新账号才走保号任务）。
-      // balance_ok === false 仍代表「重新授权成功」，只是计费通道暂时不可用
-      // （Billing 401 不等于 Chat 不可用，本项目既有结论），故只提示、不判失败。
-      // credits === -1 = 余额未知/未查到，不能显示成 0。
+      // 文案按后端「分阶段状态」分档（见 reloginDoneText），颜色也跟着档位走——
+      // 只有真的回到可选号才配绿勾，别让颜色替文案撒谎。
       if (r.mode === 'relogin' || r.relogin === true) {
-        const bal = (r.balance_ok === false || r.balance_error)
-          ? '；余额校验未通过：' + (r.balance_error || '未知原因') + '（Chat 可能仍可用；授权已生效，稍后点「余额」可重试）'
-          : '';
-        $('addDone').textContent = '已重新授权，账号已恢复：' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + bal;
+        const settled = r.credentials_updated === true && r.recovered === true && r.in_rotation === true;
+        // 颜色只看「是否真的回到可选号」；停留时间还要看有没有附加真相要读（未落盘 /
+        // 计费未验证）——那种也算成功，但一闪而过人根本没看见就自动关了。
+        const clean = settled && r.state_persisted !== false &&
+          r.billing_verified !== false && r.balance_ok !== false;
+        $('addDone').className = 'state ' + (settled ? 'ok' : 'warn');
+        $('addDone').textContent = reloginDoneText(r);
+        linger = clean ? 1600 : 8000;
       } else {
+        $('addDone').className = 'state ok';
         const warn = r.balance_error ? '；但余额校验失败：' + r.balance_error + '（若持续 401，请在浏览器退出腾讯账号后重登）' : '';
         $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + warn;
       }
       invalidatePackages(); // 凭据换新：缓存里的旧 401 行必须作废
-      setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+      setTimeout(() => { closeAdd(); loadOverview(true); }, linger);
     }
   } catch (e) {
     if (loginState !== st) return;
@@ -1636,6 +1720,24 @@ async function pollLogin() {
       $('addErr').hidden = false;
       // 添加 / 重登共用一句：会话作废，重新发起即可（重登时账号本身没有被改动）。
       $('addErr').textContent = '登录会话已过期（有效 15 分钟），请重新发起；账号未被改动。';
+      return;
+    }
+    // 500 有两种来源，必须分开：面板自身「写盘失败」（凭据没落盘 = 本次授权没生效，属于
+    // 终态，必须按失败展示）与网关/反代的临时 5xx（沿用既有「5xx 继续轮询」语义：OAuth
+    // 可能已在浏览器侧完成，停掉轮询账号就永远不入池）。只认后端固定的写盘失败文案，
+    // 避免把一次网络抖动误判成终局。
+    const writeFail = e.status === 500 &&
+      /凭据写入失败|set realm|save auth|mkdir auth dir/.test(String(code || detail || ''));
+    if (writeFail) {
+      stopPoll();
+      $('addReady').hidden = true;
+      $('addDone').hidden = true;
+      $('addErr').hidden = false;
+      // 后端文案以「重新授权成功但…」开头，容易被看成成功：前端必须以失败口吻开头，
+      // 并说清旧凭证 / 旧状态还在（AdoptCredentials 落盘失败时账号状态不变）。
+      $('addErr').textContent = (pollMode === 'relogin'
+        ? '重新登录失败：凭据写入失败，本次授权未生效，原凭证与账号状态仍在（可重新发起）。'
+        : '添加账号失败：凭据写入失败，账号没有加入池中（可重新发起）。') + '服务端说明：' + detail;
       return;
     }
     pollFails++;
