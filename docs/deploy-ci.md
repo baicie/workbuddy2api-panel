@@ -12,21 +12,25 @@
   （本工作流 amd64 + 本工作流部署；`docker-ghcr.yml` 多架构并推 semver 标签）。
   不想重复可去掉 `docker-ghcr.yml` 的 `tags` 触发。
 
-## 1.1 双发布线（main / dev 两套并存）
+## 1.1 两套实例：国内（CN）/ 国际（Global）
 
-同一台服务器上跑两套实例，用**标签前缀**区分：
+同一份代码，跑**两个容器**，账号池与面板完全独立：
 
-| 标签示例 | 发布线 | 代码来源 | 部署目录 | 宿主端口 | 容器名 |
-|---|---|---|---|---|---|
-| `v2026.10.24.1639` | main | 上游代码（+ CI 文件） | `~/workbuddy2api` | 7863 | `workbuddy2api` |
-| `dev-v2026.10.24.1700` | dev | `dev` 分支（含本地功能） | `~/workbuddy2api-dev` | 7864 | `workbuddy2api-dev` |
+| 实例 | 账号池放什么 | 部署目录 | 宿主端口 | 容器名 |
+|---|---|---|---|---|
+| `cn` | 只放 CN 账号（copilot.tencent.com / codebuddy.cn） | `~/workbuddy2api` | 7863 | `workbuddy2api` |
+| `global` | 只放 Global 账号（www.workbuddy.ai） | `~/workbuddy2api-global` | 7864 | `workbuddy2api-global` |
 
-- `dev-v*` 只命中本工作流；upstream 的 `binaries.yml` / `docker-ghcr.yml` 只认 `v*`，
-  因此 dev 线**不会**创建 Release、也不会多跑一次多架构构建。
-- 每条线的目录/端口/容器名由工作流内置档案决定（不依赖仓库级 Variables——Variables 是
-  全仓一份，无法按分支区分）。
-- compose 端口写成 `${HOST_PORT:-7863}:7863`，容器内固定 7863，宿主端口按线区分。
-- compose 项目名 = 容器名，两套的容器/网络互不影响。
+- 一次发布（打 tag）构建**一个镜像**，然后矩阵并行部署两套；`fail-fast: false`
+  让一套失败不挡住另一套。
+- 只想更新其中一套：Actions → Build and Push → Run workflow，`targets` 填 `cn` 或 `global`。
+- **隔离原理**：本仓按账号 realm 路由，实例里只放对应 realm 的账号即天然隔离
+  （CN 实例收到国际模型请求会因"没有 global 账号"直接 503，不会串号）。
+  两套的 `config.json` 都**不要**把 `global.enabled` 设为 `false`——那是"逃生门"，
+  会把 global 账号强判成 cn 并打到错误的上游域。
+- 两套的 `auths/`、`data/`、`api_key` 各自独立：同一账号可以分别加到两套里，互不影响。
+- 已实测该服务器到两个上游域均可达（`www.workbuddy.ai` / `copilot.tencent.com` /
+  `www.codebuddy.cn` 全 200）。
 
 ## 2. 需要配置的仓库 Secrets / Variables
 
