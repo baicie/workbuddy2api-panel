@@ -185,8 +185,27 @@ jobs:
           IMAGE="$1"; TAG="$2"; CONTAINER="$3"; RAW_DIR="$4"; HEALTH="$5"
           DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
 
+          # docker 访问权限：云主机常见「用户在 sudo 组、但不在 docker 组」，
+          # 直连 socket 会 permission denied。这里自动回退到 sudo，避免部署直接失败。
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker); echo "==> docker: 直连（当前用户已在 docker 组）"
+          elif sudo -n true >/dev/null 2>&1; then
+            DOCKER=(sudo -n docker); echo "==> docker: 经 sudo（当前用户不在 docker 组）"
+          else
+            echo "::error::当前用户无法访问 docker，且无免密 sudo。请在服务器执行：sudo usermod -aG docker <user> 后重新登录"
+            exit 1
+          fi
+
+          # compose 依赖 IMAGE_TAG 等环境变量；走 sudo 时 sudo 会清空环境，
+          # 所以用 `env` 显式把它们传给命令。
+          if [[ "${DOCKER[0]}" == "sudo" ]]; then
+            RUN=(sudo -n env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+          else
+            RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+          fi
+
           echo "==> docker pull ${IMAGE}:${TAG}"
-          docker pull "${IMAGE}:${TAG}"
+          "${RUN[@]}" pull "${IMAGE}:${TAG}"
 
           cd "${DIR}"
           # config.json 必须先存在：缺失时 Docker 会把 bind mount 建成目录，容器随即
@@ -197,29 +216,21 @@ jobs:
             exit 1
           fi
 
-          export IMAGE_REPO="${IMAGE}"
-          export IMAGE_TAG="${TAG}"
-          export CONTAINER_NAME="${CONTAINER}"
-          export COMPOSE_PROJECT_NAME=workbuddy2api
-
           echo "==> 滚动更新（${DIR}）"
-          if docker compose version >/dev/null 2>&1; then
-            docker compose -f docker-compose.deploy.yml up -d --pull always --remove-orphans
-          elif command -v docker-compose >/dev/null 2>&1; then
-            docker-compose -f docker-compose.deploy.yml up -d --pull always --remove-orphans
-          else
-            echo "::error::服务器上没有 docker compose / docker-compose"
+          if ! "${RUN[@]}" compose version >/dev/null 2>&1; then
+            echo "::error::服务器缺少 docker compose 插件（需要 docker compose 或 docker-compose）"
             exit 1
           fi
+          "${RUN[@]}" compose -f docker-compose.deploy.yml up -d --pull always --remove-orphans
 
           echo "==> 容器状态"
-          docker ps --filter "name=${CONTAINER}" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+          "${RUN[@]}" ps --filter "name=${CONTAINER}" --format 'table {{.Names}}	{{.Image}}	{{.Status}}	{{.Ports}}'
 
-          # 容器必须是 running，否则本次发布判失败（不允许 CI 绿着但服务没起来）。
-          state="$(docker inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo missing)"
+          # 容器必须 running，否则本次发布判失败（不允许 CI 绿着但服务没起来）。
+          state="$("${RUN[@]}" inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo missing)"
           if [[ "${state}" != "running" ]]; then
             echo "::error::容器 ${CONTAINER} 状态=${state}，发布失败"
-            docker logs --tail 80 "${CONTAINER}" 2>&1 || true
+            "${RUN[@]}" logs --tail 80 "${CONTAINER}" 2>&1 || true
             exit 1
           fi
 
@@ -234,7 +245,7 @@ jobs:
             fi
           fi
 
-          docker image prune -f >/dev/null 2>&1 || true
+          "${RUN[@]}" image prune -f >/dev/null 2>&1 || true
           echo "部署完成：${IMAGE}:${TAG}"
           REMOTE
 

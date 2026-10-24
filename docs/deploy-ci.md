@@ -27,6 +27,21 @@ Settings → Secrets and variables → Actions：
 | Variable | `DEPLOY_CONTAINER` | 否 | **默认 `workbuddy2api`**；若服务器上容器名不同（CSV 里记录的是 `grokcli-2api`）请务必改成实际名字 |
 | Variable | `DEPLOY_HEALTH_URL` | 否 | 部署后健康检查地址，需返回 200，例如 `http://127.0.0.1:7863/panel/`。**不要填 `/healthz`**：它在账号池为空时按设计返回 503 |
 
+### 2.1 Docker 权限（发现于 82.156.234.84 实测）
+
+云主机常见：部署用户（如 `ubuntu`）在 `sudo` 组但**不在 `docker` 组**，
+直连 `/var/run/docker.sock` 会 `permission denied`。工作流会自动判断：
+
+- 能直连 → 用 `docker`；
+- 不能但有**免密 sudo** → 用 `sudo -n docker`（并通过 `env` 显式传 `IMAGE_TAG` 等变量，因为 sudo 清环境）；
+- 两者都不行 → 明确报错并提示 `sudo usermod -aG docker <user>`。
+
+想省掉 sudo 这一层（更干净，也让人工 `docker ps` 可用），在服务器执行一次：
+
+```bash
+sudo usermod -aG docker "$USER"    # 之后新开的 SSH 会话生效
+```
+
 > `GITHUB_TOKEN` 不能用于服务器侧拉镜像；GHCR 包当前是 public，服务器 `docker pull` 无需登录。
 > 若将来把包改成 private，需要在服务器上 `docker login ghcr.io` 或改用带 `read:packages` 的 PAT。
 
