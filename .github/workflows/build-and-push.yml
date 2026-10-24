@@ -16,6 +16,11 @@ on:
   # 手动补发/补部署用：只有在**默认分支**上存在本文件时，Actions 列表里才出现该按钮
   # （本仓默认分支 main 是上游镜像，本文件在 dev 上）。
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并部署的镜像 tag（留空则用 dev-<sha>；手动补发时填已有 tag，如 v2026.10.24.1639）"
+        required: false
+        default: ""
 
 # 同一 ref 串行，避免两个部署同时改服务器上的容器。
 concurrency:
@@ -36,16 +41,21 @@ jobs:
     outputs:
       tag: ${{ steps.vars.outputs.tag }}
       image: ${{ steps.vars.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Resolve tag
         id: vars
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          # tag 触发时 ref_name 形如 v2026.10.24.1614；手动触发时回退到 dev-<sha>，
-          # 避免产出无法追溯的标签。
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          # 优先用手动输入（补发/补部署时指到已有 tag，避免再造 Release）；
+          # 其次 tag 触发的 ref_name；最后回退到 dev-<sha>。
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            tag="${INPUT_TAG}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             tag="${GITHUB_REF_NAME}"
           else
             tag="dev-${GITHUB_SHA::7}"
@@ -67,6 +77,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -99,6 +110,11 @@ jobs:
     env:
       DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
       IMAGE_REF: ${{ needs.docker.outputs.image }}
+      # 镜像 digest：部署时按 digest 拉取（内容寻址），可安全使用第三方加速源。
+      IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+      # 国内云主机直连 ghcr.io 实测约 21KB/s（35MB 镜像需 ~28 分钟），
+      # 故默认先走 GHCR 加速源；多个用逗号分隔，按顺序尝试。
+      GHCR_MIRRORS: ${{ vars.GHCR_MIRRORS || 'ghcr.nju.edu.cn' }}
       # 目标机默认值来自 docker_targets_82.156.234.84.csv（host/port/user）。
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
@@ -180,10 +196,12 @@ jobs:
 
           # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
           "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
-            "${IMAGE_REF}" "${DEPLOY_TAG}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" <<'REMOTE'
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" <<'REMOTE'
           set -euo pipefail
-          IMAGE="$1"; TAG="$2"; CONTAINER="$3"; RAW_DIR="$4"; HEALTH="$5"
+          IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"
           DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
+          CANONICAL="${IMAGE}:${TAG}"
+          REPO_PATH="${IMAGE#ghcr.io/}"
 
           # docker 访问权限：云主机常见「用户在 sudo 组、但不在 docker 组」，
           # 直连 socket 会 permission denied。这里自动回退到 sudo，避免部署直接失败。
@@ -204,8 +222,39 @@ jobs:
             RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
           fi
 
-          echo "==> docker pull ${IMAGE}:${TAG}"
-          "${RUN[@]}" pull "${IMAGE}:${TAG}"
+          # 国内云主机直连 ghcr.io 实测约 21.5KB/s（35MB 镜像需近半小时），故镜像源优先。
+          # **按 digest 拉取**：内容寻址，加速源无法替换镜像内容（哈希必须一致），
+          # 这也让"用第三方加速"不再是一个纯信任问题。
+          candidates=()
+          _add_mirrors() {
+            local suffix="$1"
+            [[ -z "${MIRRORS}" ]] && return 0
+            local IFS=','
+            for m in ${MIRRORS}; do
+              m="$(printf '%s' "$m" | tr -d '[:space:]')"
+              [[ -n "$m" ]] && candidates+=("${m}/${REPO_PATH}${suffix}")
+            done
+          }
+          if [[ -n "${DIGEST}" ]]; then
+            _add_mirrors "@${DIGEST}"
+            candidates+=("${IMAGE}@${DIGEST}")
+          else
+            _add_mirrors ":${TAG}"
+            candidates+=("${CANONICAL}")
+          fi
+
+          PULLED=""
+          for ref in "${candidates[@]}"; do
+            echo "==> docker pull ${ref}"
+            if timeout 240 "${RUN[@]}" pull "${ref}"; then PULLED="${ref}"; break; fi
+            echo "    （该源失败/超时，尝试下一个）"
+          done
+          if [[ -z "${PULLED}" ]]; then
+            echo "::error::所有镜像源都拉取失败：${candidates[*]}"
+            exit 1
+          fi
+          "${RUN[@]}" tag "${PULLED}" "${CANONICAL}"
+          echo "==> 镜像就绪：${CANONICAL}（来源 ${PULLED}）"
 
           cd "${DIR}"
           # config.json 必须先存在：缺失时 Docker 会把 bind mount 建成目录，容器随即
@@ -221,7 +270,8 @@ jobs:
             echo "::error::服务器缺少 docker compose 插件（需要 docker compose 或 docker-compose）"
             exit 1
           fi
-          "${RUN[@]}" compose -f docker-compose.deploy.yml up -d --pull always --remove-orphans
+          # --pull never：镜像已在上一步按 digest 拉好并改成规范名，这里不要再回源
+          "${RUN[@]}" compose -f docker-compose.deploy.yml up -d --pull never --remove-orphans
 
           echo "==> 容器状态"
           "${RUN[@]}" ps --filter "name=${CONTAINER}" --format 'table {{.Names}}	{{.Image}}	{{.Status}}	{{.Ports}}'
