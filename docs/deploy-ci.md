@@ -12,20 +12,20 @@
   （本工作流 amd64 + 本工作流部署；`docker-ghcr.yml` 多架构并推 semver 标签）。
   不想重复可去掉 `docker-ghcr.yml` 的 `tags` 触发。
 
-## 1.1 两套实例：国内（CN）/ 国际（Global）
+## 1.1 两套实例：国内（CN）/ 国际（Global），按**分支线**区分
 
-同一份代码，跑**两个容器**，账号池与面板完全独立：
+| 分支 + 标签 | 实例 | 账号池放什么 | 部署目录 | 宿主端口 | 容器名 |
+|---|---|---|---|---|---|
+| `main` + `v*` | **国内版** | CN 账号（copilot.tencent.com / codebuddy.cn） | `~/workbuddy2api` | 7863 | `workbuddy2api` |
+| `dev` + `dev-v*` | **国际版**（实验） | Global 账号（www.workbuddy.ai） | `~/workbuddy2api-global` | 7864 | `workbuddy2api-global` |
 
-| 实例 | 账号池放什么 | 部署目录 | 宿主端口 | 容器名 |
-|---|---|---|---|---|
-| `cn` | 只放 CN 账号（copilot.tencent.com / codebuddy.cn） | `~/workbuddy2api` | 7863 | `workbuddy2api` |
-| `global` | 只放 Global 账号（www.workbuddy.ai） | `~/workbuddy2api-global` | 7864 | `workbuddy2api-global` |
-
-- 一次发布（打 tag）构建**一个镜像**，然后矩阵并行部署两套；`fail-fast: false`
-  让一套失败不挡住另一套。
-- 只想更新其中一套：Actions → Build and Push → Run workflow，`targets` 填 `cn` 或 `global`。
+- 一条分支线只对应一个实例：main 线发布只更新国内实例，dev 线发布只更新国际实例，
+  互不影响（国际版是实验性质，出问题不会波及国内那套）。
+- `dev-v*` 只命中本工作流；upstream 的 `binaries.yml` / `docker-ghcr.yml` 只认 `v*`，
+  所以 dev 线不会创建 Release、不会多跑多架构构建。
+- 实例档案（目录/端口/容器名/健康检查）由工作流按 tag 前缀内置决定，不依赖仓库级 Variables。
 - **隔离原理**：本仓按账号 realm 路由，实例里只放对应 realm 的账号即天然隔离
-  （CN 实例收到国际模型请求会因"没有 global 账号"直接 503，不会串号）。
+  （国内实例收到国际模型请求会因"没有 global 账号"直接 503，不会串号）。
   两套的 `config.json` 都**不要**把 `global.enabled` 设为 `false`——那是"逃生门"，
   会把 global 账号强判成 cn 并打到错误的上游域。
 - 两套的 `auths/`、`data/`、`api_key` 各自独立：同一账号可以分别加到两套里，互不影响。
