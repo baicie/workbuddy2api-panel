@@ -24,10 +24,6 @@ on:
         description: "要构建并部署的镜像 tag（留空则用 dev-<sha>；手动补发时填已有 tag，如 v2026.10.24.1639）"
         required: false
         default: ""
-      targets:
-        description: "部署哪些实例：both（默认）/ cn / global"
-        required: false
-        default: "both"
 
 # 同一 ref 串行，避免两个部署同时改服务器上的容器。
 concurrency:
@@ -49,6 +45,11 @@ jobs:
       tag: ${{ steps.vars.outputs.tag }}
       image: ${{ steps.vars.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
+      target: ${{ steps.vars.outputs.target }}
+      deploy_dir: ${{ steps.vars.outputs.deploy_dir }}
+      deploy_port: ${{ steps.vars.outputs.deploy_port }}
+      deploy_name: ${{ steps.vars.outputs.deploy_name }}
+      health_url: ${{ steps.vars.outputs.health_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,11 +68,34 @@ jobs:
           else
             tag="dev-${GITHUB_SHA::7}"
           fi
+          # 分支线 = realm 实例（一一对应）：
+          #   main + v*      → 国内版实例：部署 CN 账号（copilot.tencent.com / codebuddy.cn）
+          #   dev  + dev-v*  → 国际版实例：实验性质，部署 Global 账号（www.workbuddy.ai）
+          # 两条线各有独立目录 / 宿主端口 / 容器名 / 账号池 / api_key，互不影响。
+          if [[ "${tag}" == dev-v* ]]; then
+            release="dev"
+            target="global"
+            deploy_dir="$HOME/workbuddy2api-global"
+            deploy_port="7864"
+            deploy_name="workbuddy2api-global"
+          else
+            release="main"
+            target="cn"
+            deploy_dir="$HOME/workbuddy2api"
+            deploy_port="7863"
+            deploy_name="workbuddy2api"
+          fi
           {
             echo "tag=${tag}"
             echo "image=${IMAGE}"
+            echo "release=${release}"
+            echo "target=${target}"
+            echo "deploy_dir=${deploy_dir}"
+            echo "deploy_port=${deploy_port}"
+            echo "deploy_name=${deploy_name}"
+            echo "health_url=http://127.0.0.1:${deploy_port}/panel/"
           } >> "$GITHUB_OUTPUT"
-          echo "building ${IMAGE}:${tag} from ${GITHUB_SHA}"
+          echo "building ${IMAGE}:${tag}（${release} 线 → ${target} 实例：${deploy_dir} :${deploy_port} / ${deploy_name}）"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -108,49 +132,12 @@ jobs:
           # 双保险：确认刚推的 tag 真在 registry 上，防止"推送失败但 CI 绿"。
           docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
 
-  # 按 workflow_dispatch 的 targets 计算要部署哪些实例。
-  # 注意：job 级 if 不能引用 matrix（矩阵展开前求值），所以矩阵本身按需生成。
-  prepare:
-    name: prepare-targets
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-      selected: ${{ steps.gen.outputs.selected }}
-    steps:
-      - name: Build matrix
-        id: gen
-        env:
-          TARGETS: ${{ inputs.targets }}
-        run: |
-          set -euo pipefail
-          case "${TARGETS:-both}" in
-            cn)      sel="cn" ;;
-            global)  sel="global" ;;
-            *)       sel="both" ;;
-          esac
-          cn='{"name":"cn","dir":"$HOME/workbuddy2api","port":"7863","container":"workbuddy2api"}'
-          gl='{"name":"global","dir":"$HOME/workbuddy2api-global","port":"7864","container":"workbuddy2api-global"}'
-          case "${sel}" in
-            cn)     matrix="{\"include\":[${cn}]}" ;;
-            global) matrix="{\"include\":[${gl}]}" ;;
-            *)      matrix="{\"include\":[${cn},${gl}]}" ;;
-          esac
-          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
-          echo "selected=${sel}" >> "$GITHUB_OUTPUT"
-          echo "targets=${sel}"
-
   deploy:
-    name: deploy-${{ matrix.name }}
-    needs: [docker, prepare]
+    name: deploy-${{ needs.docker.outputs.target }}
+    needs: docker
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    strategy:
-      # 一套失败不挡住另一套（例如国际版网络抖动不该影响国内实例更新）
-      fail-fast: false
-      # 矩阵由 prepare 生成：cn = 国内实例（~/workbuddy2api, 7863, workbuddy2api）；
-      # global = 国际实例（~/workbuddy2api-global, 7864, workbuddy2api-global）。
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
       IMAGE_REF: ${{ needs.docker.outputs.image }}
@@ -162,12 +149,13 @@ jobs:
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
       DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-      # 该实例的部署档案由矩阵给出（两套账号池/端口/容器完全独立）。
-      DEPLOY_DIR: ${{ matrix.dir }}
-      CONTAINER: ${{ matrix.container }}
-      HOST_PORT: ${{ matrix.port }}
-      HEALTH_URL: http://127.0.0.1:${{ matrix.port }}/panel/
-      TARGET_NAME: ${{ matrix.name }}
+      # 该发布线对应的实例档案（由 Resolve tag 决定）：
+      #   main → CN 实例；dev → Global 实例。
+      DEPLOY_DIR: ${{ needs.docker.outputs.deploy_dir }}
+      CONTAINER: ${{ needs.docker.outputs.deploy_name }}
+      HOST_PORT: ${{ needs.docker.outputs.deploy_port }}
+      HEALTH_URL: ${{ needs.docker.outputs.health_url }}
+      TARGET_NAME: ${{ needs.docker.outputs.target }}
       SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
     steps:
