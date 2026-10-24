@@ -1,0 +1,254 @@
+name: Build and Push
+
+# 打 v* 标签时：构建 linux/amd64 镜像 → 推送 GHCR → 通过 SSH 滚动更新自有服务器上的容器。
+#
+# 与既有 docker-ghcr.yml 的分工：
+#   - docker-ghcr.yml：push 到 main / 打 tag 时构建**多架构**镜像（main 推 latest/main/sha-*），
+#     并在 PR 上做构建验证。
+#   - 本工作流：**发布**流程。tag 时构建 amd64 单架构、推送与 tag 同名的镜像，并把
+#     服务器上的容器滚动到该版本（含容器状态校验与可选健康检查）。
+# 两者都会被 tag 触发（各构建一次）。若不想重复构建，可去掉 docker-ghcr.yml 的 tags
+# 触发；本工作流不擅自改既有工作流。
+on:
+  push:
+    tags:
+      - "v*"
+  # 手动补发/补部署用：只有在**默认分支**上存在本文件时，Actions 列表里才出现该按钮
+  # （本仓默认分支 main 是上游镜像，本文件在 dev 上）。
+  workflow_dispatch:
+
+# 同一 ref 串行，避免两个部署同时改服务器上的容器。
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/baicie/workbuddy2api-panel
+
+jobs:
+  docker:
+    name: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      image: ${{ steps.vars.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: vars
+        run: |
+          # tag 触发时 ref_name 形如 v2026.10.24.1614；手动触发时回退到 dev-<sha>，
+          # 避免产出无法追溯的标签。
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="dev-${GITHUB_SHA::7}"
+          fi
+          {
+            echo "tag=${tag}"
+            echo "image=${IMAGE}"
+          } >> "$GITHUB_OUTPUT"
+          echo "building ${IMAGE}:${tag} from ${GITHUB_SHA}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # 与需求一致：只出 amd64。要 arm64 时改成 "linux/amd64,linux/arm64"，
+          # 并加一步 docker/setup-qemu-action@v3。
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+          labels: |
+            org.opencontainers.image.title=workbuddy2api-panel
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=build-and-push
+          cache-to: type=gha,mode=max,scope=build-and-push
+          # 关闭 provenance：避免 ghcr 页面出现 unknown/unknown 架构条目（与 docker-ghcr.yml 同口径）。
+          provenance: false
+
+      - name: Verify pushed tag
+        run: |
+          # 双保险：确认刚推的 tag 真在 registry 上，防止"推送失败但 CI 绿"。
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
+
+  deploy:
+    name: deploy-to-server
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
+      IMAGE_REF: ${{ needs.docker.outputs.image }}
+      # 目标机默认值来自 docker_targets_82.156.234.84.csv（host/port/user）。
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      # 支持 $HOME / ~ 写法（远端负责展开），默认 ~/workbuddy2api
+      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '$HOME/workbuddy2api' }}
+      CONTAINER: ${{ vars.DEPLOY_CONTAINER || 'workbuddy2api' }}
+      HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || '' }}
+      SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check deploy credentials
+        id: cred
+        run: |
+          set -euo pipefail
+          if [[ -n "${SSH_KEY:-}" ]]; then
+            method=key
+          elif [[ -n "${SSH_PASSWORD:-}" ]]; then
+            method=password
+          else
+            echo "::error::缺少部署凭据：请在仓库 Secrets 配置 DEPLOY_SSH_KEY（推荐）或 DEPLOY_SSH_PASSWORD"
+            exit 1
+          fi
+          echo "method=${method}" >> "$GITHUB_OUTPUT"
+          echo "deploy target: ${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PORT} dir=${DEPLOY_DIR} container=${CONTAINER}"
+
+      - name: Install SSH client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openssh-client sshpass
+
+      - name: Upload deploy compose
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          if [[ "${{ steps.cred.outputs.method }}" == "key" ]]; then
+            printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes)
+          else
+            printf '%s' "${SSH_PASSWORD}" > ~/.ssh/pass
+            chmod 600 ~/.ssh/pass
+            SSH=(sshpass -f ~/.ssh/pass ssh)
+          fi
+          SSH+=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p "${DEPLOY_PORT}")
+
+          # 服务器不需要 git 仓库：目录按需创建，compose 文件用 base64 单次传过去
+          # （避开 rsync 与 sshpass 的交互问题，也不依赖 scp 的路径展开行为）。
+          COMPOSE_B64="$(base64 < deploy/docker-compose.deploy.yml | tr -d '\n')"
+          "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- "${DEPLOY_DIR}" "${COMPOSE_B64}" <<'REMOTE'
+          set -euo pipefail
+          RAW_DIR="$1"; B64="$2"
+          # 远端展开 ~ 与 $HOME（这两个写法在传参时不会二次展开，必须在远端处理）。
+          DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
+          COMPOSE_PATH="${DIR}/docker-compose.deploy.yml"
+          mkdir -p "$DIR"
+          printf '%s' "$B64" | base64 -d > "$COMPOSE_PATH"
+          chmod 644 "$COMPOSE_PATH"
+          echo "compose 已就绪: $COMPOSE_PATH"
+          REMOTE
+
+      - name: Rolling update container
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          if [[ "${{ steps.cred.outputs.method }}" == "key" ]]; then
+            printf '%s\n' "${SSH_KEY}" > ~/.ssh/deploy_key
+            chmod 600 ~/.ssh/deploy_key
+            SSH=(ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes)
+          else
+            printf '%s' "${SSH_PASSWORD}" > ~/.ssh/pass
+            chmod 600 ~/.ssh/pass
+            SSH=(sshpass -f ~/.ssh/pass ssh)
+          fi
+          SSH+=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p "${DEPLOY_PORT}")
+
+          # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
+          "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" <<'REMOTE'
+          set -euo pipefail
+          IMAGE="$1"; TAG="$2"; CONTAINER="$3"; RAW_DIR="$4"; HEALTH="$5"
+          DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
+
+          # docker 访问权限：云主机常见「用户在 sudo 组、但不在 docker 组」，
+          # 直连 socket 会 permission denied。这里自动回退到 sudo，避免部署直接失败。
+          if docker info >/dev/null 2>&1; then
+            DOCKER=(docker); echo "==> docker: 直连（当前用户已在 docker 组）"
+          elif sudo -n true >/dev/null 2>&1; then
+            DOCKER=(sudo -n docker); echo "==> docker: 经 sudo（当前用户不在 docker 组）"
+          else
+            echo "::error::当前用户无法访问 docker，且无免密 sudo。请在服务器执行：sudo usermod -aG docker <user> 后重新登录"
+            exit 1
+          fi
+
+          # compose 依赖 IMAGE_TAG 等环境变量；走 sudo 时 sudo 会清空环境，
+          # 所以用 `env` 显式把它们传给命令。
+          if [[ "${DOCKER[0]}" == "sudo" ]]; then
+            RUN=(sudo -n env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+          else
+            RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+          fi
+
+          echo "==> docker pull ${IMAGE}:${TAG}"
+          "${RUN[@]}" pull "${IMAGE}:${TAG}"
+
+          cd "${DIR}"
+          # config.json 必须先存在：缺失时 Docker 会把 bind mount 建成目录，容器随即
+          # 启动失败且原因很隐蔽。这里显式失败并给出可操作提示。
+          if [[ ! -f config.json ]]; then
+            echo "::error::${DIR}/config.json 不存在。首次部署请在该目录执行："
+            echo "  cp <repo>/config.example.json ${DIR}/config.json   # 再按需填 api_key"
+            exit 1
+          fi
+
+          echo "==> 滚动更新（${DIR}）"
+          if ! "${RUN[@]}" compose version >/dev/null 2>&1; then
+            echo "::error::服务器缺少 docker compose 插件（需要 docker compose 或 docker-compose）"
+            exit 1
+          fi
+          "${RUN[@]}" compose -f docker-compose.deploy.yml up -d --pull always --remove-orphans
+
+          echo "==> 容器状态"
+          "${RUN[@]}" ps --filter "name=${CONTAINER}" --format 'table {{.Names}}	{{.Image}}	{{.Status}}	{{.Ports}}'
+
+          # 容器必须 running，否则本次发布判失败（不允许 CI 绿着但服务没起来）。
+          state="$("${RUN[@]}" inspect -f '{{.State.Status}}' "${CONTAINER}" 2>/dev/null || echo missing)"
+          if [[ "${state}" != "running" ]]; then
+            echo "::error::容器 ${CONTAINER} 状态=${state}，发布失败"
+            "${RUN[@]}" logs --tail 80 "${CONTAINER}" 2>&1 || true
+            exit 1
+          fi
+
+          # 可选健康检查：/healthz 在「池里没有可用账号」时按设计返回 503，故默认不查它；
+          # 需要时把 DEPLOY_HEALTH_URL 设为 http://127.0.0.1:7863/panel/ 之类的地址。
+          if [[ -n "${HEALTH}" ]]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${HEALTH}" || echo 000)"
+            echo "==> 健康检查 ${HEALTH} -> HTTP ${code}"
+            if [[ "${code}" != "200" ]]; then
+              echo "::error::健康检查未通过（HTTP ${code}）"
+              exit 1
+            fi
+          fi
+
+          "${RUN[@]}" image prune -f >/dev/null 2>&1 || true
+          echo "部署完成：${IMAGE}:${TAG}"
+          REMOTE
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f ~/.ssh/deploy_key ~/.ssh/pass
