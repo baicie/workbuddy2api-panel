@@ -108,30 +108,49 @@ jobs:
           # 双保险：确认刚推的 tag 真在 registry 上，防止"推送失败但 CI 绿"。
           docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
 
+  # 按 workflow_dispatch 的 targets 计算要部署哪些实例。
+  # 注意：job 级 if 不能引用 matrix（矩阵展开前求值），所以矩阵本身按需生成。
+  prepare:
+    name: prepare-targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      selected: ${{ steps.gen.outputs.selected }}
+    steps:
+      - name: Build matrix
+        id: gen
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          case "${TARGETS:-both}" in
+            cn)      sel="cn" ;;
+            global)  sel="global" ;;
+            *)       sel="both" ;;
+          esac
+          cn='{"name":"cn","dir":"$HOME/workbuddy2api","port":"7863","container":"workbuddy2api"}'
+          gl='{"name":"global","dir":"$HOME/workbuddy2api-global","port":"7864","container":"workbuddy2api-global"}'
+          case "${sel}" in
+            cn)     matrix="{\"include\":[${cn}]}" ;;
+            global) matrix="{\"include\":[${gl}]}" ;;
+            *)      matrix="{\"include\":[${cn},${gl}]}" ;;
+          esac
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "selected=${sel}" >> "$GITHUB_OUTPUT"
+          echo "targets=${sel}"
+
   deploy:
     name: deploy-${{ matrix.name }}
-    needs: docker
+    needs: [docker, prepare]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     strategy:
       # 一套失败不挡住另一套（例如国际版网络抖动不该影响国内实例更新）
       fail-fast: false
-      matrix:
-        include:
-          # 国内实例：账号池只放 CN 账号（copilot.tencent.com / codebuddy.cn）。
-          # 目录与容器名沿用第一次部署的那套，零迁移、不抢端口。
-          - name: cn
-            dir: $HOME/workbuddy2api
-            port: "7863"
-            container: workbuddy2api
-          # 国际实例：账号池只放 Global 账号（www.workbuddy.ai）。
-          - name: global
-            dir: $HOME/workbuddy2api-global
-            port: "7864"
-            container: workbuddy2api-global
-    # 只部署被点名的实例；tag 触发时默认两套都部署
-    if: ${{ inputs.targets == '' || inputs.targets == 'both' || inputs.targets == matrix.name }}
+      # 矩阵由 prepare 生成：cn = 国内实例（~/workbuddy2api, 7863, workbuddy2api）；
+      # global = 国际实例（~/workbuddy2api-global, 7864, workbuddy2api-global）。
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
       IMAGE_REF: ${{ needs.docker.outputs.image }}
