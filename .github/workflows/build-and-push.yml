@@ -72,16 +72,19 @@ jobs:
           #   main + v*      → 国内版实例：部署 CN 账号（copilot.tencent.com / codebuddy.cn）
           #   dev  + dev-v*  → 国际版实例：实验性质，部署 Global 账号（www.workbuddy.ai）
           # 两条线各有独立目录 / 宿主端口 / 容器名 / 账号池 / api_key，互不影响。
+          # 注意：这里必须用字面量 ~（不要写 $HOME）——本步骤跑在 runner 上，
+          # $HOME 会被展开成 /home/runner/...，而目标路径是**服务器**上的家目录；
+          # 远端脚本再把 ~ 展开成服务器用户的 $HOME。
           if [[ "${tag}" == dev-v* ]]; then
             release="dev"
             target="global"
-            deploy_dir="$HOME/workbuddy2api-global"
+            deploy_dir="~/workbuddy2api-global"
             deploy_port="7864"
             deploy_name="workbuddy2api-global"
           else
             release="main"
             target="cn"
-            deploy_dir="$HOME/workbuddy2api"
+            deploy_dir="~/workbuddy2api"
             deploy_port="7863"
             deploy_name="workbuddy2api"
           fi
