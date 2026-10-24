@@ -1,0 +1,31 @@
+# 服务器侧部署用 compose（**镜像型**：不在服务器上构建，只拉 GHCR 镜像）。
+#
+# 由 .github/workflows/build-and-push.yml 在打 v* 标签时自动上传到：
+#   ${DEPLOY_DIR}/docker-compose.deploy.yml     默认 ~/workbuddy2api/
+# 然后以 IMAGE_TAG=<v...> 执行 `docker compose -f docker-compose.deploy.yml up -d --pull always`。
+#
+# 与仓库根目录的 docker-compose.yml 的区别：那份是 `build: .`（本地构建）；
+# 这份是发布产物，供服务器直接拉取指定版本。
+#
+# 首次部署前，服务器上该目录里必须已存在 config.json（从 config.example.json 复制，
+# 按需填 api_key 等）。缺失时 Docker 会把挂载点创建成**目录**，容器随即启动失败，
+# 所以工作流会在 up 之前显式检查并报错退出。
+services:
+  wb2api:
+    image: ${IMAGE_REPO:-ghcr.io/baicie/workbuddy2api-panel}:${IMAGE_TAG:-latest}
+    container_name: ${CONTAINER_NAME:-workbuddy2api}
+    restart: unless-stopped
+    # 与仓库 compose 同口径：容器默认以 app 用户（uid 10001）运行；宿主机挂载目录
+    # 属主不同会导致写 auths/*.json.tmp 失败。可用 .env 的 PUID/PGID 覆盖。
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 不挂 :ro：面板「配置」页需要写回此文件（保存后热生效）。
+      - ./config.json:/app/config.json
+    # 不覆盖镜像自带的 HEALTHCHECK：它按「池里是否有可服务账号」判定（空池为 503），
+    # 是上游刻意的语义。若编排需要「进程活着即健康」，可在这里显式改成探 /panel/。
