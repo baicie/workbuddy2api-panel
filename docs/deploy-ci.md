@@ -50,6 +50,21 @@ sudo chown -R 10001:10001 ~/workbuddy2api/auths ~/workbuddy2api/data ~/workbuddy
 cd <旧目录> && docker compose down
 ```
 
+### 3.1 服务器上已有同名容器 / 端口占用（首次切换必看）
+
+本工作流用 **compose 项目 `workbuddy2api`** 管理容器，容器名取 `DEPLOY_CONTAINER`
+（默认 `workbuddy2api`）。如果服务器上已有一个**不是本 compose 创建**的同名容器
+（`docker_targets_*.csv` 里记录的容器名是 `grokcli-2api`，若本项目容器就叫这个名，
+请把仓库 Variable `DEPLOY_CONTAINER` 设为 `grokcli-2api`），首次部署会遇到两类错误：
+
+| 报错 | 原因 | 处理 |
+|---|---|---|
+| `Conflict. The container name "/xxx" is already in use` | 同名容器由别的 compose 项目/`docker run` 创建 | 先 `docker stop <name> && docker rm <name>`（**先确认 auths/data 是宿主机 bind mount，删容器不丢数据**），再重跑工作流 |
+| `Bind for 0.0.0.0:7863 failed: port is already allocated` | 旧容器仍占用 7863 | 同上：先停掉旧容器 |
+
+安全检查：`docker inspect <旧容器> --format '{{json .Mounts}}'` 确认挂载是宿主机目录
+（bind），而不是匿名 volume —— 只有 bind mount 的数据在删容器后仍然保留。
+
 ## 4. 手动补发
 
 ```bash
