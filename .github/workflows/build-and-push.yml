@@ -12,7 +12,10 @@ name: Build and Push
 on:
   push:
     tags:
+      # main 线：v2026.10.24.1639
       - "v*"
+      # dev 线：dev-v2026.10.24.1700（不会命中 upstream 的 binaries/docker-ghcr，二者只认 v*）
+      - "dev-v*"
   # 手动补发/补部署用：只有在**默认分支**上存在本文件时，Actions 列表里才出现该按钮
   # （本仓默认分支 main 是上游镜像，本文件在 dev 上）。
   workflow_dispatch:
@@ -42,6 +45,11 @@ jobs:
       tag: ${{ steps.vars.outputs.tag }}
       image: ${{ steps.vars.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
+      line: ${{ steps.vars.outputs.line }}
+      deploy_dir: ${{ steps.vars.outputs.deploy_dir }}
+      deploy_port: ${{ steps.vars.outputs.deploy_port }}
+      deploy_name: ${{ steps.vars.outputs.deploy_name }}
+      health_url: ${{ steps.vars.outputs.health_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,11 +68,34 @@ jobs:
           else
             tag="dev-${GITHUB_SHA::7}"
           fi
+          # 发布线（main / dev 是两套独立部署）：
+          #   v*      → main 线：部署上游代码那一套
+          #   dev-v*  → dev  线：部署本地功能那一套
+          # 两条线在同一条服务器上使用不同目录 / 宿主端口 / 容器名，互不干扰。
+          case "${tag}" in
+            dev-v*)
+              line="dev"
+              deploy_dir="$HOME/workbuddy2api-dev"
+              deploy_port="7864"
+              deploy_name="workbuddy2api-dev"
+              ;;
+            *)
+              line="main"
+              deploy_dir="$HOME/workbuddy2api"
+              deploy_port="7863"
+              deploy_name="workbuddy2api"
+              ;;
+          esac
           {
             echo "tag=${tag}"
             echo "image=${IMAGE}"
+            echo "line=${line}"
+            echo "deploy_dir=${deploy_dir}"
+            echo "deploy_port=${deploy_port}"
+            echo "deploy_name=${deploy_name}"
+            echo "health_url=http://127.0.0.1:${deploy_port}/panel/"
           } >> "$GITHUB_OUTPUT"
-          echo "building ${IMAGE}:${tag} from ${GITHUB_SHA}"
+          echo "building ${IMAGE}:${tag}（${line} 线 → ${deploy_dir} :${deploy_port} / ${deploy_name}）"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -119,10 +150,13 @@ jobs:
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
       DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-      # 支持 $HOME / ~ 写法（远端负责展开），默认 ~/workbuddy2api
-      DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '$HOME/workbuddy2api' }}
-      CONTAINER: ${{ vars.DEPLOY_CONTAINER || 'workbuddy2api' }}
-      HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL || '' }}
+      # 部署档案按发布线决定（见 Resolve tag），不依赖仓库级 Variables，
+      # 这样 main / dev 两套可以并行存在于同一台服务器。
+      DEPLOY_DIR: ${{ needs.docker.outputs.deploy_dir }}
+      CONTAINER: ${{ needs.docker.outputs.deploy_name }}
+      HEALTH_URL: ${{ needs.docker.outputs.health_url }}
+      HOST_PORT: ${{ needs.docker.outputs.deploy_port }}
+      RELEASE_LINE: ${{ needs.docker.outputs.line }}
       SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
     steps:
@@ -196,9 +230,9 @@ jobs:
 
           # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
           "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
-            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" <<'REMOTE'
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" "${HOST_PORT}" <<'REMOTE'
           set -euo pipefail
-          IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"
+          IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"; HOST_PORT="$8"
           DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
           CANONICAL="${IMAGE}:${TAG}"
           REPO_PATH="${IMAGE#ghcr.io/}"
@@ -217,9 +251,9 @@ jobs:
           # compose 依赖 IMAGE_TAG 等环境变量；走 sudo 时 sudo 会清空环境，
           # 所以用 `env` 显式把它们传给命令。
           if [[ "${DOCKER[0]}" == "sudo" ]]; then
-            RUN=(sudo -n env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+            RUN=(sudo -n env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" "HOST_PORT=${HOST_PORT}" "COMPOSE_PROJECT_NAME=${CONTAINER}" docker)
           else
-            RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" COMPOSE_PROJECT_NAME=workbuddy2api docker)
+            RUN=(env "IMAGE_REPO=${IMAGE}" "IMAGE_TAG=${TAG}" "CONTAINER_NAME=${CONTAINER}" "HOST_PORT=${HOST_PORT}" "COMPOSE_PROJECT_NAME=${CONTAINER}" docker)
           fi
 
           # 国内云主机直连 ghcr.io 实测约 21.5KB/s（35MB 镜像需近半小时），故镜像源优先。

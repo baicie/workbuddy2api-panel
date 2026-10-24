@@ -21,7 +21,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "7863:7863"
+      # 宿主端口按发布线区分（main=7863 / dev=7864），容器内固定 7863。
+      # 这样两套可以并存于同一台服务器，互不抢占端口。
+      - "${HOST_PORT:-7863}:7863"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
