@@ -24,6 +24,10 @@ on:
         description: "要构建并部署的镜像 tag（留空则用 dev-<sha>；手动补发时填已有 tag，如 v2026.10.24.1639）"
         required: false
         default: ""
+      targets:
+        description: "部署哪些实例：both（默认）/ cn / global"
+        required: false
+        default: "both"
 
 # 同一 ref 串行，避免两个部署同时改服务器上的容器。
 concurrency:
@@ -45,11 +49,6 @@ jobs:
       tag: ${{ steps.vars.outputs.tag }}
       image: ${{ steps.vars.outputs.image }}
       digest: ${{ steps.build.outputs.digest }}
-      line: ${{ steps.vars.outputs.line }}
-      deploy_dir: ${{ steps.vars.outputs.deploy_dir }}
-      deploy_port: ${{ steps.vars.outputs.deploy_port }}
-      deploy_name: ${{ steps.vars.outputs.deploy_name }}
-      health_url: ${{ steps.vars.outputs.health_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,34 +67,11 @@ jobs:
           else
             tag="dev-${GITHUB_SHA::7}"
           fi
-          # 发布线（main / dev 是两套独立部署）：
-          #   v*      → main 线：部署上游代码那一套
-          #   dev-v*  → dev  线：部署本地功能那一套
-          # 两条线在同一条服务器上使用不同目录 / 宿主端口 / 容器名，互不干扰。
-          case "${tag}" in
-            dev-v*)
-              line="dev"
-              deploy_dir="$HOME/workbuddy2api-dev"
-              deploy_port="7864"
-              deploy_name="workbuddy2api-dev"
-              ;;
-            *)
-              line="main"
-              deploy_dir="$HOME/workbuddy2api"
-              deploy_port="7863"
-              deploy_name="workbuddy2api"
-              ;;
-          esac
           {
             echo "tag=${tag}"
             echo "image=${IMAGE}"
-            echo "line=${line}"
-            echo "deploy_dir=${deploy_dir}"
-            echo "deploy_port=${deploy_port}"
-            echo "deploy_name=${deploy_name}"
-            echo "health_url=http://127.0.0.1:${deploy_port}/panel/"
           } >> "$GITHUB_OUTPUT"
-          echo "building ${IMAGE}:${tag}（${line} 线 → ${deploy_dir} :${deploy_port} / ${deploy_name}）"
+          echo "building ${IMAGE}:${tag} from ${GITHUB_SHA}"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -133,30 +109,46 @@ jobs:
           docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
 
   deploy:
-    name: deploy-to-server
+    name: deploy-${{ matrix.name }}
     needs: docker
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      # 一套失败不挡住另一套（例如国际版网络抖动不该影响国内实例更新）
+      fail-fast: false
+      matrix:
+        include:
+          # 国内实例：账号池只放 CN 账号（copilot.tencent.com / codebuddy.cn）。
+          # 目录与容器名沿用第一次部署的那套，零迁移、不抢端口。
+          - name: cn
+            dir: $HOME/workbuddy2api
+            port: "7863"
+            container: workbuddy2api
+          # 国际实例：账号池只放 Global 账号（www.workbuddy.ai）。
+          - name: global
+            dir: $HOME/workbuddy2api-global
+            port: "7864"
+            container: workbuddy2api-global
+    # 只部署被点名的实例；tag 触发时默认两套都部署
+    if: ${{ inputs.targets == '' || inputs.targets == 'both' || inputs.targets == matrix.name }}
     env:
       DEPLOY_TAG: ${{ needs.docker.outputs.tag }}
       IMAGE_REF: ${{ needs.docker.outputs.image }}
-      # 镜像 digest：部署时按 digest 拉取（内容寻址），可安全使用第三方加速源。
+      # 镜像 digest：按 digest 拉取（内容寻址），可安全使用第三方加速源。
       IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
-      # 国内云主机直连 ghcr.io 实测约 21KB/s（35MB 镜像需 ~28 分钟），
-      # 故默认先走 GHCR 加速源；多个用逗号分隔，按顺序尝试。
+      # 国内云主机直连 ghcr.io 实测约 21KB/s（35MB 镜像需 ~28 分钟），默认先走加速源。
       GHCR_MIRRORS: ${{ vars.GHCR_MIRRORS || 'ghcr.nju.edu.cn' }}
       # 目标机默认值来自 docker_targets_82.156.234.84.csv（host/port/user）。
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST || '82.156.234.84' }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER || 'ubuntu' }}
       DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
-      # 部署档案按发布线决定（见 Resolve tag），不依赖仓库级 Variables，
-      # 这样 main / dev 两套可以并行存在于同一台服务器。
-      DEPLOY_DIR: ${{ needs.docker.outputs.deploy_dir }}
-      CONTAINER: ${{ needs.docker.outputs.deploy_name }}
-      HEALTH_URL: ${{ needs.docker.outputs.health_url }}
-      HOST_PORT: ${{ needs.docker.outputs.deploy_port }}
-      RELEASE_LINE: ${{ needs.docker.outputs.line }}
+      # 该实例的部署档案由矩阵给出（两套账号池/端口/容器完全独立）。
+      DEPLOY_DIR: ${{ matrix.dir }}
+      CONTAINER: ${{ matrix.container }}
+      HOST_PORT: ${{ matrix.port }}
+      HEALTH_URL: http://127.0.0.1:${{ matrix.port }}/panel/
+      TARGET_NAME: ${{ matrix.name }}
       SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
     steps:
