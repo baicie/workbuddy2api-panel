@@ -213,6 +213,8 @@ func (p *Pool) NoteSessionDeadFault(uid string, fault AuthFault, reason string) 
 	}
 	e.sessionDeadFails++
 	if e.sessionDeadFails < sessionDeadThreshold {
+		// 上游修复：中间计数也落盘——重启丢进度会让「离禁用还差几次」重新从零学。
+		p.dirty.Store(true)
 		return false
 	}
 	e.sessionDeadFails = 0

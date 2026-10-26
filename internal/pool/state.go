@@ -46,20 +46,9 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 // 链路，而实际是 token 被边缘判无效、只能重登。计数/阈值语义与 12153 完全共用
 // （同一个 sessionDeadFails 计数，成功即由 ClearSessionDead 清零）。
 func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return false
-	}
-	e.sessionDeadFails++
-	if e.sessionDeadFails < sessionDeadThreshold {
-		p.dirty.Store(true) // 中间计数也落盘：重启丢进度会让「离禁用还差几次」重新从零学
-		return false
-	}
-	e.sessionDeadFails = 0
-	p.disableLocked(e, reason)
-	return true
+	// 故障类型由 reason 细分（12153 vs 网关 401），计数/阈值语义不变；
+	// 类型化标记让面板能区分「认证失效」与「管理员/上游禁用」，并决定是否给重登入口。
+	return p.NoteSessionDeadFault(uid, authFaultForReason(reason), reason)
 }
 
 // NoteSessionAlive 清零 session dead 计数（refresh 验证成功 → session 仍有效）。

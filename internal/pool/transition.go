@@ -58,6 +58,11 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
+	// 认证故障标记与成因由认证路径（DisableAuth / NoteSessionDeadFault）在返回后
+	// 重新写入；这里先清空，保证非认证原因的禁用不会残留上一次的认证标记。
+	e.authFault = AuthFaultNone
+	e.authFaultAt = time.Time{}
+	e.disabledCause = DisableCauseNone
 	// 记录禁用时刻：运维需要区分「刚刚被禁」和「挂了一周没人管」，
 	// 两者处置优先级差很远（后者往往意味着没人看面板）。
 	e.disabledAt = time.Now()

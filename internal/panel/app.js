@@ -613,11 +613,16 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>',
         (personal ?
           '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' : ''),
-        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>' : ''),
+        (frozen ? '<button class="xs ghost" data-a="probe_ban" data-u="' + esc(s.uid) + '" title="只读探测上游是否已解封：不 revive、不参与选号、不改任何状态">探活</button>'
+                // 未禁用但已被上游判死（session_dead_fails>0）：「探活」槽空着，放重登入口。
+                : (offerRelogin ? '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="用浏览器重新登录该账号：只替换登录凭据，不新建账号、不改积分与冷却">重登</button>' : '')),
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
                             : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (personal ? '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额' : '退出选号，但照常保活 / 刷新额度') + '">暂停选号</button>')),
-        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>'),
+        (s.disabled
+          // 认证失效导致的禁用：该槽原本空着，用来放重登（管理员/上游封禁不提供，见 authFixable）。
+          ? (offerRelogin ? '<button class="xs primary" data-a="relogin" data-u="' + esc(s.uid) + '" title="用浏览器重新登录该账号：只替换登录凭据，不新建账号、不改积分与冷却">重登</button>' : '')
+          : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>'),
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
       ].map(html => html || '<span class="slot" aria-hidden="true"></span>').join('') +
       '</div></td></tr>';
@@ -1941,7 +1946,8 @@ async function pollLogin() {
     }
     if (r.done) {
       stopPoll();
-      loginState = null;                 // 会话已终结：关闭弹窗时不必再 cancel
+      // 与上游一致：成功后不清 loginState（会话已在服务端删除，关闭时的 cancel 是幂等空操作）。
+      // 清掉会让「成功之后的再次 poll」直接 return，上游那条「pending 超时慢等待提示」就永远不触发。
       $('addReady').hidden = true;
       $('addErr').hidden = true;
       $('addDone').hidden = false;

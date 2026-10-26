@@ -180,6 +180,19 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
+// LoginMode OAuth 会话用途：新增账号 / 重新登录（401 失效账号原位恢复）。
+// 与上游新增的 site（cn/intl/workbuddy 登录站点）正交：
+//
+//	site 决定「用哪套端点/域」，mode 决定「授权完成后做什么」。
+type LoginMode string
+
+const (
+	// LoginModeAdd 添加新账号（上游既有行为）。
+	LoginModeAdd LoginMode = "add"
+	// LoginModeRelogin 已有账号重新授权（只换凭据，不新增账号）。
+	LoginModeRelogin LoginMode = "relogin"
+)
+
 // modelsCacheTTL 面板模型列表的结果缓存时长（测试可注入短值）。只缓存「零
 // fetchErr」的完整成功响应；部分失败的结果每次照常重探，直到拿到干净目录。
 var modelsCacheTTL = 60 * time.Second
@@ -205,6 +218,12 @@ type loginSession struct {
 	// lastMsg 上一次落日志的上游结果。前端每 3s 一轮、最长 loginTTL，逐轮记日志会
 	// 把 15 分钟刷成 300 行，真正的一次性错误反被淹掉；只在结果变化时记一行。
 	lastMsg string
+	// mode 会话用途（新增 / 重新登录）。零值 = 新增账号。
+	mode LoginMode
+	// targetUID/targetNickname 重新登录的目标账号（来源只有一个：池内现有账号，
+	// 不接受前端指定），授权完成后用它做身份校验与「不新增账号」的保证。
+	targetUID      string
+	targetNickname string
 }
 
 // New 构建面板。

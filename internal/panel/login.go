@@ -308,11 +308,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	// 完成：取 uid/nickname。官方 12151（RetryFetchAccount）是「token 已发但账号信息
 	// 还在落库」，属于 pending，必须继续轮询而不是报错——否则刚登录成功的号会被
 	// 误判成失败（用户重登又撞同一个窗口）。
-	var acct struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}
+	// 复用 relogin.go 的 loginAccount（字段与上游行内结构一致），
+	// 让新增账号与重新登录两条完成分支共用一个类型。
+	var acct loginAccount
 	acctRaw, _, errAcct := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin)
 	if errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)

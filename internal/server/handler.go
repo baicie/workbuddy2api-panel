@@ -1138,7 +1138,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				} else {
 					lastErr = err
 					if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-						h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+						h.cfg.Pool.DisableAuth(acct.UID, "refresh session dead", pool.AuthFaultSessionDead)
 					} else {
 						h.cfg.Pool.NoteError(acct.UID)
 					}
@@ -2096,7 +2096,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			}
 			return
 		}
-		h.cfg.Pool.Disable(uid, "上游 12153 session dead（业务码明说登录态失效，需重新登录）")
+		h.cfg.Pool.DisableAuth(uid, "上游 12153 session dead（业务码明说登录态失效，需重新登录）", pool.AuthFaultSessionDead)
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
