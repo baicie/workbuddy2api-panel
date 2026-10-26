@@ -53,9 +53,13 @@ func (s *Scheduler) noteBalanceAuthFailure(a *auth.Auth, uid string, probeErr er
 	// Kind 之外再看一次 code=12153：doJSON 只用 env.Msg 做分类，而上游的 12153 文案
 	// 不总是英文原文（本地化后不含 marker 就会落成 ErrClient，死号便永远不计罚）。
 	if errors.As(rerr, &re) && (re.Kind == upstream.ErrSessionDead || strings.Contains(re.Msg, "12153")) {
-		// 达阈值时同时打上类型化认证故障标记（pool.AuthFaultSessionDead）：面板据此
-		// 显示「需要重新授权」并给重新登录入口，而不是把账号留成一个无来由的 disabled。
-		if s.cfg.Pool.NoteSessionDeadFault(uid, pool.AuthFaultSessionDead, "12153 session dead") {
+		// refresh token 失效 ≠ 账号不可用：AT 未过期时 chat 仍正常（issue #83，
+		// 与 keepalive 同一判据）。计死会在连续 3 轮后禁用掉一个健康账号。
+		if upstream.SessionDeadButUsable(a) {
+			log.Printf("balance %s: refresh token 已失效但 access token 仍有效，不计 session dead", label)
+			return
+		}
+		if s.cfg.Pool.NoteSessionDead(uid) {
 			log.Printf("balance %s: 连续 %d 次 401 且 refresh 判死 — 禁用（需重新登录）", label, pool.SessionDeadThreshold())
 			return
 		}

@@ -26,7 +26,12 @@
 //     （详见 reviveCoolingLocked 注释）。
 package pool
 
-import "time"
+import (
+	"log"
+	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+)
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
 // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
@@ -53,13 +58,13 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
-	// 认证故障标记与禁用成因由调用方（applyDisableLocked）在本函数返回后按优先级
-	// 重新写入；这里先清空，保证任何直接调用 disableLocked 的路径都不会残留上一次的
-	// 成因/标记（否则 ClearAuthFault 会误判，把管理员或风控的禁用当成认证禁用解掉）。
-	e.authFault = AuthFaultNone
-	e.authFaultAt = time.Time{}
-	e.disabledCause = DisableCauseNone
+	// 记录禁用时刻：运维需要区分「刚刚被禁」和「挂了一周没人管」，
+	// 两者处置优先级差很远（后者往往意味着没人看面板）。
+	e.disabledAt = time.Now()
 	p.dirty.Store(true)
+	// 禁用是需人工 revive 的终态，journal 里必须留痕：否则「号没了」只能靠轮询
+	// 面板发现，事后排障连时刻与原因都查不到。
+	log.Printf("WARN: [pool] 账号被禁用 acct=%s reason=%s（revive 前不再参与选号）", logfmt.Label(e.a.UID, e.a.Nickname), reason)
 }
 
 // pauseLocked 暂停选号迁移：置 paused 使账号退出选号候选（healthy 判否），

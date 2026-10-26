@@ -182,6 +182,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			disabled:                 s.Disabled,
 			paused:                   s.Paused,
 			reason:                   s.Reason,
+			disabledAt:               s.DisabledAt,
 			until:                    s.Until,
 			coolKind:                 s.CoolKind,
 			successCount:             s.SuccessCount,
@@ -404,6 +405,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		// 长生不老并被重启原样拾回（issue #207-4）。
 		if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
 			s.Reason, s.Until, s.CoolKind = e.reason, e.until, e.coolKind
+			s.DisabledAt = e.disabledAt
 		}
 		// 禁用成因只在禁用时落盘（未禁用时成因无意义，留着会让 state.json 出现
 		// 「disabled=false 但 cause=admin」的脏组合）。

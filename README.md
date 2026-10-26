@@ -64,7 +64,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 能力 | 说明 |
 |---|---|
-| 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
+| 🔑 **OAuth 一键登录** | `login.sh` / 面板设备授权流程，三站点可选（CN / 官方国际站 / 旧桌面端），自动落盘凭证并加载新账号 |
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
@@ -348,11 +348,26 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 **方式 B：命令行脚本（仅 Linux / macOS，依赖 bash + python3）**
 
 ```bash
-./login.sh
+./login.sh                    # 国内站（copilot.tencent.com）
+./login.sh --site=intl        # 官方国际站（www.codebuddy.ai）
+./login.sh --site=workbuddy   # 旧桌面端国际版（www.workbuddy.ai）
+./login.sh --realm=global     # 兼容旧写法，等价 --site=workbuddy
 # 按提示在浏览器打开授权链接 → 回到终端确认 → 凭证落盘 auths/workbuddy-<uid>.json
 ```
 
-`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
+`login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到（仅 CN）+ 凭证落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
+
+**站点口径对齐官方 CLI 2.174.0**（`internal/loginsite` 是唯一来源，面板与 `login.sh` 共用）：
+
+| 站点 | 上游 API | Origin | 说明 |
+|---|---|---|---|
+| `cn` | `copilot.tencent.com` | `www.codebuddy.cn` | 国内站（缺省） |
+| `intl` | `www.codebuddy.ai` | `www.codebuddy.ai` | 官方国际站（CLI `product.json` 的 externalDomain），新账号选这个 |
+| `workbuddy` | `www.workbuddy.ai` | `www.workbuddy.ai` | 旧桌面端国际版，仅已注册在该域的老账号 |
+
+两个国际站实测**同一后端**（同一 token 打两域，`/billing/meter/get-user-resource-summary` 返回相同的 PackageCode 与容量），差别只在主机名与 WAF 口径。授权链接会自动补官方的 `version` 参数；`platform=workbuddy` 域在部署侧提供 `CODEBUDDY_LOGIN_DEVICE_NONCE` 时再补 `ww_device_nonce`（本仓无桌面端设备指纹 SDK，不伪造）。
+
+登录轮询按官方码表分类：`11217`（RetryFetchToken）/ `12151`（RetryFetchAccount）继续轮询，`12005`（席位满）/ `11212`（许可证过期）/ `11216`（试用到期）**立即终态报错**并透出上游 msg，不再空转到会话 TTL。
 
 > Windows 用户请用方式 A（或 WSL）；`login.sh` 需要 python3。
 
@@ -394,7 +409,18 @@ curl -s http://localhost:7863/v1/responses \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","input":"hi","stream":false}'
+
+# anthropic_messages（Claude Code / Anthropic SDK 原生协议，无需中间层翻译）
+# 客户端侧把 ANTHROPIC_BASE_URL 指到网关根（SDK 自己拼 /v1/messages）；
+# api_key 非空时两种鉴权头都认，选其一即可。
+curl -s http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
+
+`POST /v1/messages/count_tokens` **未实现**（404）：Claude Code 的上下文预算估算会退回本地字符估算，功能不受影响，但别把它当成网关故障。
 
 ## 配置说明
 
@@ -411,6 +437,8 @@ curl -s http://localhost:7863/v1/responses \
 | `dns_servers` | `[]` | 出站解析用的 DNS 服务器（`["223.5.5.5","119.29.29.29"]`；也可用 `WB2A_DNS` 逗号分隔覆盖）。空 = 系统解析器。给没有 `/etc/resolv.conf` 的环境用（Android 上 Go 解析器会退回 `[::1]:53`，所有域名解析失败），本地 DNS 被污染时也可借此直连可信解析器。改动需重启 |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；大上下文/文件块经反代转发超时会 400 `read body: i/o timeout`；`0` = 不限制；改动需重启（#100） |
 | `panel.package_detail_limit` | `5` | 积分构成页单账号默认展示的最早到期包数；其余未用完包与已用完包聚合折叠 |
+| `update.auto_enabled` | `false` | 是否每天按上海时间自动检查并安装新的时间标签版 Release；仅原生 Linux / Windows `amd64` / `arm64` 二进制支持原地更新 |
+| `update.auto_time` | `04:00` | 自动更新时间，格式 `HH:MM`，按上海时间执行；容器 / systemd 等托管部署会检测版本但需手动更新镜像或下载 Release |
 | `logging.request_archive_enabled` | `true` | 请求元数据 JSONL 归档开关；不记录提示词、响应正文或 Authorization |
 | `logging.request_retention_days` | `7` | 请求归档保留天数；超期文件在启动和周期清理时删除 |
 | `logging.request_archive_max_mb` | `100` | 请求归档总容量上限（MiB）；超限优先删除最旧文件 |
@@ -643,6 +671,15 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 
 一行 = 一个 (域, 模型)，状态三态：`locked`（该域参与选号的号全被这个模型挡住，换模型或等解锁才有用）、`starved`（此刻没号能服务，但不是模型冷却造成的——账号级冷却/熔断/在途占满，等一下就好）、`partial`（还有号能服务，只是部分被锁）。数据与 `/status` 的 `model_locks` 同源（池内现算，只读），与 `ModelBlocked`（请求失败时回 400 `model_unavailable`）互补。禁用与暂停选号的账号不计入分母，`AuditOnly` 台账与已过期的冷却不算锁——口径与选号严格一致。
 
+全池锁定时的错误形态按**锁因**分流，因为「等一等能好」和「等到重置也没用」对客户端是相反的处置：
+
+| 全池锁因 | 响应 | 为什么 |
+|---|---|---|
+| `6004` / `6000` 用量配额（上游：使用量已超出频率限制，将在 … 重置） | `429` + `error.code` = 上游业务码（数字）+ 上游原文，**不带 `Retry-After`** | 重置前重试必然同样失败；客户端据业务码判「不可重试」，立即报错换模型/等额度 |
+| `14003` 模型繁忙 | `503` + `code=model_busy` + `Retry-After`（≤600s） | 瞬时繁忙，等就有；`Retry-After` 封顶是因为客户端拿它当「睡多久」，几十分钟的冷却会让它静默挂起 |
+| `11102` / `11158` 等确定性拒绝 | `400` + `code=model_unavailable` | 换号/重试都无效，只有换模型有用 |
+| 混因（不同号不同锁因） | 按代表锁因走上面的可重试/不可重试口径 | 不把「还有号会自己恢复」判成永久不可用 |
+
 #### 整体不可用模型（模型锁池下方那张表）
 
 与上面的「模型锁池」**必须分清**：那张是**限流**（等就有），这张是**上游没有这个模型**（等不到）。混在一起会让运维对着一个永远不会自动恢复的模型等限流窗口过去。
@@ -774,14 +811,16 @@ http://127.0.0.1:7863/panel/
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」）。列表支持**按条件查询**：关键词（ID / 名称 / 描述 / 厂商，空格分词 AND）、域（CN / Global）、能力（工具 / 视觉 / 思考 / 默认）、思考档位、价格（折扣 / 限时免费 / 打折），以及按倍率、上下文、最大输出、ID 排序。**出图模型的倍率另有口径**：真实单价在每次出图回执 `usage.credit` 里，上游目录对出图模型**已基本不再报牌价**——CN `hunyuan-image-alpha` 实扣固定 **5.71/张**（与尺寸、画质、`n` 无关，回执带 `output_image_coefficient:1`），global `hy-image-3.5` 实扣固定 **0.27/张**（low/medium/high × 512/1024/1536 六档同价；回执恒 `output_image_tokens:15000` 但不带 coefficient——**token 数不代表单价**，按 token 反推价格会算错）。旧的 global `gpt-image-2.5-sunburst` 已下架（`400 code=14401 route config not found`），不再列出。面板因此把「牌价」与「实扣」分列，并按尺寸×画质分档显示（`charge_variants`），不用均值互相覆盖 |
 | **用量** | 指标卡（请求数 / 总 token / prompt / completion / 失败 / 平均延迟）+ Token 时序图（渐变柱、均值线、峰值标注）+ 用量明细（按账号 / 模型 / 域切换）+ 积分扣除历史。**时间范围**支持 今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / **自定义区间**（精确到分钟），卡片、表格与图表全部按同一窗口统计 |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关、日志来源记录开关 |
+| **配置** | 在线编辑 config.json：API 密钥、版本更新（自动更新开关与上海时间）、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关、日志来源记录开关 |
 | **运行日志** | **请求记录表**（时间 / 结果 / 模型 / 账号 / **来源 IP** / **User-Agent** / 耗时 / Token / 积分 / 请求 ID），支持关键词与结果筛选、读取条数，以及 今天 / 近 24 小时 / 近 7 天 / **自定义区间**等**时间范围**查询（由归档侧按时间取，不是筛已拉取的条目）+ 最近 500 行服务日志（按任务 / 对话 / 系统分频道，可开关自动滚动），并新增 **积分历史**（每次真实查到余额与上次比对，变动即留痕） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
-`models.hidden`、`models.aliases`、`logging.request_client_info`、`pool.*`（熔断/在途/权重/保底倍率上限）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
+`models.hidden`、`models.aliases`、`logging.request_client_info`、`pool.*`（熔断/在途/权重/保底倍率上限）、`schedule.*`（时点/开关/余额刷新间隔）、`update.*`（自动更新时间）**立即生效，无需重启**；
 涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`、`admin`、`metrics`、`alerting`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
+
+面板左上角会显示当前版本；启动后会定期查询 GitHub Release，发现更新时显示提醒。设置页可手动检查、打开 Release 或一键更新。更新前会校验 GitHub SHA-256 摘要并在替换失败时恢复旧程序；Docker、systemd / Windows 服务等托管环境只提示手动更新，避免覆盖由宿主机或镜像管理的程序文件。
 
 顶部「刷新」按钮 = 向上游全量查询真实余额并回写（5 秒自动轮询只读内存，不打上游）。
 
@@ -967,6 +1006,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
+- **可从官方 CLI 直接导入**：官方 CodeBuddy CLI 的登录态在 `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\Tencent-Cloud.coding-copilot.info`（Linux/macOS 对应 `~/.local/share`、`~/Library/Application Support`），字段与本仓 auth 文件同构（`account.uid/nickname` + `auth.accessToken/refreshToken/domain`），复制成 `auths/workbuddy-<uid>.json` 即可入池，无需重走 SSO。**两处差异已由解析层吸收**：① 官方 `expiresAt` 是**毫秒**（本仓内部按秒，`Parse` 自动归一，否则到期时间会落到公元 58800 年 → token 永不刷新 → 一个月后静默全 401）；② 官方国际站 domain 是 `www.codebuddy.ai`（本仓已按 `*.codebuddy.ai` 判 global，并按 domain 选上游主机）
 
 ### 2. 网络暴露与日志敏感度
 

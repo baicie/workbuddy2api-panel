@@ -46,8 +46,34 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 // 链路，而实际是 token 被边缘判无效、只能重登。计数/阈值语义与 12153 完全共用
 // （同一个 sessionDeadFails 计数，成功即由 ClearSessionDead 清零）。
 func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
-	// 故障类型由 reason 细分（12153 vs 网关 401），计数/阈值语义不变。
-	return p.NoteSessionDeadFault(uid, authFaultForReason(reason), reason)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.sessionDeadFails++
+	if e.sessionDeadFails < sessionDeadThreshold {
+		p.dirty.Store(true) // 中间计数也落盘：重启丢进度会让「离禁用还差几次」重新从零学
+		return false
+	}
+	e.sessionDeadFails = 0
+	p.disableLocked(e, reason)
+	return true
+}
+
+// NoteSessionAlive 清零 session dead 计数（refresh 验证成功 → session 仍有效）。
+//
+// 为什么需要（20261024）：网关 401 有两种成因且响应体一样，只能靠 refresh 区分。
+// 判定为「瞬时拦截」时必须清零——否则多次瞬时拦截会累积到阈值（3 次）把健康账号
+// 禁用掉，这正是本次误杀两号的机制。
+func (p *Pool) NoteSessionAlive(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
+		e.sessionDeadFails = 0
+		p.dirty.Store(true) // 清零点落盘：不置脏时重启会复活旧计数，误杀刚自证存活的账号
+	}
 }
 
 // ClearSessionDead 清连续 12153 计数——账号被证明未死的任何时刻调用：
@@ -55,8 +81,9 @@ func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
 		e.sessionDeadFails = 0
+		p.dirty.Store(true) // 同上：清零不落盘的话，重启后旧计数会把下次失败直接推到阈值
 	}
 }
 
@@ -70,6 +97,7 @@ func (p *Pool) ReviveDisabled(uid string) {
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
 		e.reason = ""
+		e.disabledAt = time.Time{}
 		e.sessionDeadFails = 0
 		// 人工复活同样意味着「不再需要重登」，认证故障标记一并清（否则面板会
 		// 在已解冻的账号上继续显示"需重新授权"）。
@@ -787,7 +815,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		AuthFault:            string(e.authFault),
 		AuthFaultAt:          e.authFaultAt,
 		Disabled:             e.disabled,
-		DisabledCause:        string(e.disabledCause),
+		DisabledAt:           disabledAtRFC3339(e),
 		Paused:               e.paused,
 		SuccessCount:         e.successCount,
 		ErrTotal:             e.errTotal,
@@ -842,6 +870,15 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		}
 	}
 	return st
+}
+
+// disabledAtRFC3339 把 entry.disabledAt 转成对外字符串（零值返回空，JSON 里省略）。
+// 单独抽出来是为了两处一致：实时 statusOf 与持久化恢复后都要同一口径。
+func disabledAtRFC3339(e *entry) string {
+	if e.disabledAt.IsZero() {
+		return ""
+	}
+	return e.disabledAt.Format(time.RFC3339)
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
