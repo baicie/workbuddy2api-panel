@@ -116,6 +116,13 @@ jobs:
         with:
           context: .
           push: true
+          # 必须注入面板版本号：Dockerfile 是 `ARG APP_VERSION=dev` 兜底，不传 build-args
+          # 时运行中的 appVersion 就是 "dev"；updater 里 parseVersion("dev") 失败会让
+          # `UpdateAvailable = !currentOK || …` 恒为 true，左上角「有更新」徽章永远亮着
+          # （2026-10-27 排查：真实部署 v2026.10.27.403 仍显示有更新）。传 tag 后徽章只在
+          # 「上游确实发了比当前部署更新的 Release」时才亮。
+          build-args: |
+            APP_VERSION=${{ steps.vars.outputs.tag }}
           # 与需求一致：只出 amd64。要 arm64 时改成 "linux/amd64,linux/arm64"，
           # 并加一步 docker/setup-qemu-action@v3。
           platforms: linux/amd64
