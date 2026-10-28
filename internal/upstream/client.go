@@ -25,6 +25,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
+	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -907,10 +908,19 @@ func New() *Client {
 		// 三条路径两个域返回一致，workbuddy.cn 对海外出口也不复位握手（见
 		// cmd/server/config.go 的 cn.chat_base 注释）。
 		ChatBaseCN: "https://www.workbuddy.cn",
-		// BillingBaseCN 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
-		// 桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三类区分（README「任务计分」），
-		// 改这里会连带改掉 CLI 类任务的指纹来源。
-		BillingBaseCN: "https://www.codebuddy.cn",
+		// BillingBaseCN 改为 **www.workbuddy.cn**（2026-10-28，5.9.3 真机）。
+		//
+		// 客户端把 CN 侧**全部** billing / growth / activity 打到 workbuddy.cn，没有一条
+		// 打 codebuddy.cn：/v2/billing/meter/checkin-activity-status 23 条、
+		// /billing/meter/get-user-resource-{summary,free-packages,paid-packages} 12 条、
+		// /activity/growth/* 13 条、/billing/ide/trial、/billing/pay/* —— 全部 host
+		// = www.workbuddy.cn，全部 200。
+		//
+		// 旧值 codebuddy.cn 是 CodeBuddy CLI 时代的旧口径（本仓曾按「CLI 指纹在
+		// codebuddy.cn、桌面指纹在 chat 域、web 指纹在 workbuddy.cn」三分来点亮任务）。
+		// 按「以最新客户端为准」改为与客户端一致；需要退回旧口径时用
+		// config `cn.billing_base` 显式覆盖（见 cmd/server/config.go）。
+		BillingBaseCN: "https://www.workbuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
@@ -1342,7 +1352,9 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	// body 恒为 `{}`：5.9.3 真机 refresh 请求体是 2 字节 `{}`（Content-Length: 2），
+	// 不是空 body。旧实现 nil reader → Content-Length: 0，与客户端不同。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("{}"))
 	if err != nil {
 		return &refreshResult{err: err, at: time.Now()}
 	}
@@ -2264,11 +2276,13 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
+	// X-Request-ID：5.9.3 真机 /v3/config 必带（9 条全有，纯随机 32 hex）。
+	req.Header.Set("X-Request-ID", session.NewTraceID())
+	// X-CodeBuddy-Request：客户端 /v3/config **不发**，故不注入（旧实现发了）。
 	if ua == "" {
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
