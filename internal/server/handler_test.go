@@ -1858,8 +1858,66 @@ func TestStatusRequiresAuth(t *testing.T) {
 	}
 }
 
-// TestContentBlockedTriggersDegradedRetry passthrough 模式下首请求 400（11128 文案）
-// → 降级重试（Degraded）→ 200，客户端无感。验证第二次出站 body 为 Degraded。
+// TestContentBlockedSplitSystemFirst 11-128 的首选抢救是「拆句留在 system」：
+// 多句 system 被拆成多条 system 消息重试，**不搬到 user**（承载通道不变）。
+// 单句 system 拆不动时才走搬家（见 TestContentBlockedTriggersDegradedRetry）。
+func TestContentBlockedSplitSystemFirst(t *testing.T) {
+	var bodies [][]byte
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, raw)
+			if len(bodies) == 1 {
+				return &http.Response{
+					StatusCode: 400,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"code":11-128,"msg":"blocked by security policy"}`)),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
+
+	const sys = "Fingerprint sentence one here. Fingerprint sentence two here."
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"`+sys+`"},{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls, got %d", len(bodies))
+	}
+	var second map[string]any
+	if err := json.Unmarshal(bodies[1], &second); err != nil {
+		t.Fatalf("second body json: %v", err)
+	}
+	msgs := second["messages"].([]any)
+	// 拆成两条 system + 原 user；全文仍在 system 里，user 未被塞入 system 原文。
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 条消息（2 system + 1 user），got %d: %v", len(msgs), msgs)
+	}
+	for i := 0; i < 2; i++ {
+		if role := msgs[i].(map[string]any)["role"]; role != "system" {
+			t.Errorf("第 %d 条应为 system: %v", i, role)
+		}
+	}
+	if got := msgs[2].(map[string]any)["content"]; got != "hi" {
+		t.Errorf("user 被动了: %v", got)
+	}
+}
+
+// TestContentBlockedTriggersDegradedRetry 单句 system 拆不动 → 走搬家：
+// passthrough 模式下首请求 400（11-128 文案）→ 重试 → 200，客户端无感。
+// 断言第二次出站的 system 是 Degraded 中性句、system 原文进了首条 user。
 func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	// 记录每次出站请求体，断言第二次为 Degraded 文本。
 	var bodies [][]byte
