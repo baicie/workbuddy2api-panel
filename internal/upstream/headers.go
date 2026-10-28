@@ -310,17 +310,35 @@ func (c *Client) injectIdentityHeaders(req *http.Request, a *auth.Auth) {
 		return
 	}
 	enterprise := strings.TrimSpace(a.EnterpriseID)
-	if enterprise == "" {
-		// 个人号：与官方客户端一致，三头全不发（不看 token_source）。
+	method := a.TokenSource()
+	idSource := a.IdSource()
+	// 2026-10-28 补（issue #35 后续）：X-Id-Source 是**独立于企业态**的身份维度。
+	// 反编译的 runIdentityHeaders() 里 enterpriseId 与 idSource 各自触发各自的头：
+	// 有 idSource 就发 X-Id-Source，X-Userinfo 里也带 id_source 段。旧实现只要
+	// EnterpriseID 为空就整函数 return，带 id_source 声明的个人号因此漏发该头、
+	// X-Userinfo 也少一段——与真机形态对不上。
+	if idSource != "" {
+		req.Header.Set("X-Id-Source", idSource)
+	}
+	// 个人号且无身份来源：与官方客户端一致，三头全不发（**不看** token_source，
+	// 见下方 2026-10-22 补注）。
+	if enterprise == "" && idSource == "" {
 		return
 	}
-	method := a.TokenSource()
-	if method != "" {
+	if enterprise != "" && method != "" {
 		req.Header.Set("X-Auth-Method", method)
 	}
+	// X-Userinfo 的每段都是**条件拼接**：缺哪个维度就不出现该键，而不是写空串。
 	payload := map[string]any{"uin": a.UID}
-	payload["owner_uin"] = enterprise
-	if method != "" {
+	if enterprise != "" {
+		payload["owner_uin"] = enterprise
+	}
+	if idSource != "" {
+		payload["id_source"] = idSource
+	}
+	// token_source 只在企业态下才进 X-Userinfo：个人号那一条是 token 的来路声明，
+	// 不是身份语义（issue #51，两版真机个人号都没有该段）。
+	if enterprise != "" && method != "" {
 		payload["token_source"] = method
 	}
 	raw, err := json.Marshal(payload)
@@ -348,8 +366,17 @@ type ChatMeta struct {
 	// 与 ConversationID 分开：头是「客户端声明的会话」，缓存槽是「网关认的同一会话」——
 	// 无 conversation_id 的客户端（Claude Code 等）只填这个，头部仍不伪造。
 	CacheKeyID            string
-	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	ConversationRequestID string // X-Conversation-Request-ID：对话轮级聚合主键，必发
+	// RootRequestID X-Root-Request-ID：**会话级根**请求 ID（真机取 session.meta.rootRequestId，
+	// 会话首个请求生成、整会话复用，与轮级的 ConversationRequestID 不是同一个值）。
+	// 空 → 回落 ConversationRequestID：真机 chat 7/7 都带该头，零值 meta 的调用方
+	// （夜猫子、面板任务、测试）不能因为「没有根」就把头整个丢掉。
+	RootRequestID string
+	TraceID       string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	// AgentType X-Agent-Type 场景枚举：空 = main（用户主对话）。网关自发、不属于用户
+	// 对话的模型调用（面板自动任务、夜猫子、工具侧摘要）填 auxiliary。真机另有
+	// compaction / subagent / team 三档，网关没有对应路径，故不预留假值。
+	AgentType string
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -419,7 +446,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 即「开了模型优化（默认开）→ 声明 false（允许用于改进）」；只有企业版或用户显式
 	// 关掉优化时才发 "true"。真机 7 条 /v2/chat/completions 全部是 `X-Private-Data: false`
 	// （含 main 与 auxiliary 两条链）。旧实现写死 "true"，与客户端默认态相反。
-	req.Header.Set("X-Private-Data", "false")
+	// 2026-10-28 补：值不再写死 false —— privateDataHeaderValue 按账号形态二选一
+	// （企业版默认关模型优化 → true；个人号 → false）。
+	req.Header.Set("X-Private-Data", privateDataHeaderValue(a))
 	// 身份头族（X-Auth-Method / X-Userinfo）：按账号形态条件注入，见
 	// injectIdentityHeaders——个人号三头全不发才是官方形态。
 	c.injectIdentityHeaders(req, a)
@@ -430,7 +459,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, a.UID, meta)
 	// SDK / agent 段指纹头（x-stainless-* / x-agent-type / x-agent-intent）。
-	c.injectClientSDKHeaders(req)
+	c.injectClientSDKHeaders(req, meta.AgentType)
 	// X-CodeBuddy-Request: 1 —— 5.9.3 真机**仅 chat** 携带（真机为小写键，HTTP 头大小写
 	// 不敏感，等价）。其余业务路径不带，故从 CommonHeaders 移到这里。
 	c.injectCodeBuddyRequest(req)
@@ -442,6 +471,19 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// （真机：buddyId=,buddyName=,codebuddy.session_id=<conv>,codebuddy.conversation_request_id=<req>）。
 	// 注意空值也发（`buddyId=`），是与 OTel baggage 序列化一致的形态，不是漏填。
 	c.injectBaggage(req, a.UID, meta)
+}
+
+// privateDataHeaderValue 出站 X-Private-Data 取值。
+//
+// 反编译：p[PRIVATE_DATA_HEADER] = resolveModelOptimizationEnabled(...) ? "false" : "true"，
+// 即「模型优化开着」= 允许数据用于改进 → false。企业版默认关优化（合规），个人号默认开。
+// 网关没有「用户手动关优化」这个开关可读，故按账号形态取：企业版 true，其余 false。
+// 这是本批修复里唯一仍带妥协的一项（个人号若在上游侧手动关了优化，网关发不出 true）。
+func privateDataHeaderValue(a *auth.Auth) string {
+	if a != nil && a.IsEnterprise() {
+		return "true"
+	}
+	return "false"
 }
 
 // injectGlobalChatHeaders global 账号的 chat 专属域声明头。
@@ -485,7 +527,9 @@ func (c *Client) injectConversationHeaders(req *http.Request, uid string, meta C
 	} else if src := cacheKeySource(meta); src != "" {
 		// 客户端没声明会话：用与 prompt_cache_key 同源的 uid 隔离键填该头。
 		// 不带 uid 段的话，同一客户端会话打在不同账号上会共用同一个上游缓存槽（见文件头隔离约束）。
-		req.Header.Set("X-Conversation-ID", buildCacheKey(uid, src))
+		// 形态必须 v7（真机恒 01a1815d-… 时间有序），故走 buildTimeOrderedUUID 而非
+		// buildCacheKey——后者是 v4，摆到该头上就是与真机相反的形态（见该函数注释）。
+		req.Header.Set("X-Conversation-ID", buildTimeOrderedUUID(uid, src, ""))
 	} else {
 		// 零值 ChatMeta（夜猫子对话、面板模型任务等无 body 会话概念的调用方）：
 		// 头族是**渠道校验**的一部分——上游要求三件套齐全，缺任一头即 400
@@ -498,7 +542,15 @@ func (c *Client) injectConversationHeaders(req *http.Request, uid string, meta C
 	req.Header.Set("X-Conversation-Request-ID", convReqID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
-	req.Header.Set("X-Root-Request-ID", convReqID)
+	// X-Root-Request-ID：真机取 session.meta.rootRequestId（会话根，整会话复用），
+	// 删掉「恒等于轮级聚合主键」的旧行为——那让该头只是 X-Conversation-Request-ID 的
+	// 复制品，两族恒等本身就是网关自造的痕迹（真机两者语义分层：根 vs 轮）。
+	// 调用方给不出会话根时（零值 meta）仍回落轮级值，头不丢。
+	rootReqID := meta.RootRequestID
+	if rootReqID == "" {
+		rootReqID = convReqID
+	}
+	req.Header.Set("X-Root-Request-ID", rootReqID)
 	// X-Trace-ID 与 request id **互不回落**：国际版 5.8.4 真机实测，X-Trace-ID 恒为
 	// 一条独立的 32 hex（样本 0ece3294f88c4ec5a02e78547617f874），而
 	// X-Conversation-Request-ID 是另一条时间有序 ID（01a160b2…），二者从无相等。
@@ -537,7 +589,9 @@ func (c *Client) injectConversationHeaders(req *http.Request, uid string, meta C
 	// 网关没有 ACP 连接层，按「同 (账号, 会话) 稳定、与会话 ID 不同值」派生，
 	// 语义与官方一致；无会话源时现造一个（该路径无跨请求稳定语义）。
 	if src := cacheKeySource(meta); src != "" {
-		req.Header.Set("acp-connection-id", buildStableUUID(uid, src, "acp"))
+		// 同样必须 v7：真机 acp-connection-id 与 X-Conversation-ID 同为 `01a1815d-…`
+		// 时间有序形态（只是值不同），旧实现摆 v4 位是错的（见 buildTimeOrderedUUID）。
+		req.Header.Set("acp-connection-id", buildTimeOrderedUUID(uid, src, "acp"))
 	} else {
 		// 无会话源：现造客户端同形态 v7 UUID（真机 acp-connection-id 与
 		// X-Conversation-ID 同为 `01a1815d-…` 时间有序形态，只是值不同）。
@@ -561,13 +615,28 @@ const (
 	clientSDKVer   = "6.25.0"
 	agentTypeMain  = "main"
 	agentIntentCrf = "craft"
+	// agentTypeAuxiliary 辅助链档位：真机 resolveModelCallAgentType 的次要分支取值，
+	// 用于非用户主对话的模型调用（标题/摘要/网关自发任务）。主对话恒 main。
+	agentTypeAuxiliary = "auxiliary"
+)
+
+// X-Agent-Type 的服务层取值（ChatMeta.AgentType 用）：空串等价 AgentTypeMain。
+const (
+	AgentTypeMain      = agentTypeMain
+	AgentTypeAuxiliary = agentTypeAuxiliary
 )
 
 // injectClientSDKHeaders 注入 x-stainless-* 与 x-agent-* 两族出站头。
 // 仅在 chat 路径调用（ChatHeaders）——billing / checkin 等 REST 域没有真机对照证据，
 // 不臆造。
-func (c *Client) injectClientSDKHeaders(req *http.Request) {
-	req.Header.Set("X-Agent-Type", agentTypeMain)
+func (c *Client) injectClientSDKHeaders(req *http.Request, agentType string) {
+	// X-Agent-Type 按场景取（ChatMeta.AgentType）：空 = 用户主对话 main；
+	// auxiliary = 网关自发/辅助链。真机还会出 compaction/subagent/team，网关无对应
+	// 路径，不臆造。旧实现恒发 main，等于让面板任务、夜猫子都自称用户主对话。
+	if agentType == "" {
+		agentType = agentTypeMain
+	}
+	req.Header.Set("X-Agent-Type", agentType)
 	req.Header.Set("X-Agent-Intent", agentIntentCrf)
 	req.Header.Set("X-Stainless-Lang", clientLang)
 	req.Header.Set("X-Stainless-Package-Version", clientSDKVer)
@@ -601,8 +670,14 @@ func (c *Client) injectBaggage(req *http.Request, uid string, meta ChatMeta) {
 	if reqID == "" {
 		reqID = req.Header.Get("X-Conversation-Request-ID")
 	}
+	// 2026-10-28 补：真机 baggage 除两个 codebuddy.* 键外还承载 x-agent-runtime /
+	// x-agent-intent —— 客户端的 resolveAgentRuntime / resolveRequestScene 就是从
+	// baggage 里读这两项的（不是只读同名的两个请求头）。此前只发 4 个键，缺这两个
+	// 就等于告诉上游「这个 agent 运行时不知道自己是哪个运行时」。
 	req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conv+
-		",codebuddy.conversation_request_id="+reqID)
+		",codebuddy.conversation_request_id="+reqID+
+		",x-agent-runtime="+req.Header.Get("X-Agent-Runtime")+
+		",x-agent-intent="+req.Header.Get("X-Agent-Intent"))
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
