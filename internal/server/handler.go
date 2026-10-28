@@ -1140,6 +1140,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+	// X-Root-Request-ID：真机语义是「会话根请求 ID」（整会话复用），不是轮级聚合主键。
+	// 网关的会话级稳定值就是 sessKey 派生的 ID —— 有粘性会话键时用它当根，
+	// 否则留空（injectConversationHeaders 回落轮级值，头不丢）。
+	if sessKey != "" {
+		chatMeta.RootRequestID = session.RequestIDForKey("root:" + sessKey)
+	}
 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
