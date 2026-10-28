@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -920,6 +921,29 @@ func New() *Client {
 	return c
 }
 
+// gzipMinChatBody 出站 chat body 触发 gzip 压缩的最小字节数。
+// 真机 body（~51 KB）带 Content-Encoding: gzip；极小 body（心跳/短补全）压了反而更长，
+// 且客户端对小请求同样不压，故设阈值而非无条件压缩。
+const gzipMinChatBody = 1024
+
+// gzipBody 用标准库 gzip 压缩出站 body（BestSpeed：客户端用 zlib 默认级别，
+// 上游不校验压缩率，只解码；BestSpeed 省 CPU 且不改变可解性）。
+func gzipBody(src []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(src); err != nil {
+		zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
 func (c *Client) chatHTTP() *http.Client {
 	if c.ChatHTTP != nil {
@@ -1485,11 +1509,25 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+		// 请求体编码：5.9.3 真机 chat body 是 **gzip 压缩**的（头 `Content-Encoding: gzip`
+		// + body 以 1f 8b 开头，Accept-Encoding 同时声明 gzip, compress, deflate, br）。
+		// 旧实现发明文 JSON，body 字节与编码头两处都与客户端不同。小 body 不压
+		// （压缩收益为负且客户端亦非一律压），阈值取 gzipMinChatBody。
+		outBody := prepared
+		gzipped := false
+		if len(outBody) >= gzipMinChatBody {
+			if z, zerr := gzipBody(outBody); zerr == nil {
+				outBody, gzipped = z, true
+			}
+		}
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(outBody))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if gzipped {
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
