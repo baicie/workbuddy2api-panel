@@ -481,15 +481,47 @@ setTimeout(() => {
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+let accRealmFilter = 'all';
+let lastAccountsList = [];
+
 function renderAccounts(list) {
+  lastAccountsList = Array.isArray(list) ? list : [];
   const tb = $('accBody');
-  if (!list.length) {
-    setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
+  const total = lastAccountsList.length;
+  const globalCnt = lastAccountsList.filter(s => s.realm === 'global').length;
+  const cnCnt = total - globalCnt;
+
+  const elTabs = $('accRealmTabs');
+  if (elTabs) {
+    const cAll = $('accCntAll'), cCn = $('accCntCn'), cGl = $('accCntGlobal');
+    if (cAll) cAll.textContent = total;
+    if (cCn) cCn.textContent = cnCnt;
+    if (cGl) cGl.textContent = globalCnt;
+    elTabs.querySelectorAll('button[data-realm]').forEach(b => {
+      b.classList.toggle('on', b.dataset.realm === accRealmFilter);
+    });
+  }
+
+  let filtered = lastAccountsList;
+  if (accRealmFilter === 'cn') {
+    filtered = lastAccountsList.filter(s => s.realm !== 'global');
+  } else if (accRealmFilter === 'global') {
+    filtered = lastAccountsList.filter(s => s.realm === 'global');
+  }
+
+  if (!filtered.length) {
+    if (!total) {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>');
+    } else if (accRealmFilter === 'cn') {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国内版账号</div>当前账号池内均为国际版账号（共 ' + globalCnt + ' 个）</div></td></tr>');
+    } else if (accRealmFilter === 'global') {
+      setHTML(tb, '<tr><td colspan="9"><div class="empty"><div class="big">暂无国际版账号</div>当前账号池内均为国内版账号（共 ' + cnCnt + ' 个）</div></td></tr>');
+    }
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  setHTML(tb, list.map(s => {
+  const maxCred = Math.max(1, ...filtered.map(s => s.credits || 0));
+  setHTML(tb, filtered.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
@@ -554,9 +586,14 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    const rawWho = s.nickname || s.uid || '';
+    const nameHtml = remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    const tags = (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') +
+      (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') +
+      (s.api_key ? ' <span class="realm-tag">API Key</span>' : '');
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + remarkName(s.uid, s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + (s.api_key ? ' <span class="realm-tag">API Key</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm"><span class="nm-name" title="' + esc(rawWho) + '">' + nameHtml + '</span>' + tags + '</div><div class="id" title="uid: ' + esc(s.uid) + '">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -829,6 +866,16 @@ $('btnActivityAll').onclick = async () => {
   try { await api('activity_all', { method: 'POST' }); toast('活跃上报已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
 };
+if ($('accRealmTabs')) {
+  $('accRealmTabs').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-realm]');
+    if (!btn) return;
+    const r = btn.dataset.realm;
+    if (r === accRealmFilter) return;
+    accRealmFilter = r;
+    renderAccounts(lastAccountsList);
+  });
+}
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
 /* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，

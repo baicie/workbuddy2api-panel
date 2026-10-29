@@ -268,14 +268,16 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 /* .radios label 里的单选框必须收成控件自身宽度：面板全局给 form input 设了
    100% 宽 + block，直接套到 radio 上会把整行文字挤成竖排（label 高 200~400px）。 */
 .radios input { margin-top: 3px; flex: none; width: auto; display: inline-block; }
-.who { min-width: 118px; max-width: 200px; }
+.who { min-width: 130px; max-width: 240px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
-.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm { display: flex; align-items: center; gap: 5px; min-width: 0; font-weight: 550; }
+.who .nm .nm-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .nm .realm-tag { flex: none; margin-left: 0; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc.md .who .nm { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .acc.md .who .nm .mid { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
+.realm-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; font: 500 10px/1.1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); white-space: nowrap; vertical-align: middle; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -859,6 +861,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header>
           <h3>账号池</h3>
+          <span class="vtabs" id="accRealmTabs">
+            <button type="button" data-realm="all" class="on">全部<span class="cnt" id="accCntAll">0</span></button>
+            <button type="button" data-realm="cn">国内版<span class="cnt" id="accCntCn">0</span></button>
+            <button type="button" data-realm="global">国际版<span class="cnt" id="accCntGlobal">0</span></button>
+          </span>
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
           <button class="xs" id="btnRemarks">备注</button>
