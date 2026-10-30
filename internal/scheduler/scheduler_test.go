@@ -35,9 +35,6 @@ func schedFor(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveDisabled = true
 	}
-	if len(cfg.BlackcatHours) == 0 {
-		cfg.BlackcatDisabled = true
-	}
 	if len(cfg.GrowthHours) == 0 {
 		cfg.GrowthDisabled = true
 	}
@@ -87,13 +84,13 @@ func TestEnabledSlotsSingleSourceOfTruth(t *testing.T) {
 	now := time.Date(2026, 10, 15, 10, 0, 0, 0, cst.Loc)
 	all := Config{
 		CheckinHours: []int{9}, TravelHours: []int{8}, ActivityHours: []int{7},
-		KeepaliveHours: []int{6}, BlackcatHours: []int{5}, GrowthHours: []int{4},
+		KeepaliveHours: []int{6}, GrowthHours: []int{4},
 	}
-	if got := New(all).enabledSlots(now); len(got) != 6 {
-		t.Fatalf("启用任务族应为 6 类，got %d: %v", len(got), got)
+	if got := New(all).enabledSlots(now); len(got) != 5 {
+		t.Fatalf("启用任务族应为 5 类，got %d: %v", len(got), got)
 	}
-	if got := New(all).missedToday(now); len(got) != 6 {
-		t.Fatalf("时点全过时 6 类都应补跑，got %v", got)
+	if got := New(all).missedToday(now); len(got) != 5 {
+		t.Fatalf("时点全过时 5 类都应补跑，got %v", got)
 	}
 }
 
@@ -120,7 +117,6 @@ func TestRunCatchesUpMissedSlots(t *testing.T) {
 	s := New(Config{
 		Pool: p, Upstream: up, CheckinHours: []int{past},
 		TravelDisabled: true, ActivityDisabled: true, KeepaliveDisabled: true,
-		BlackcatDisabled: true, GrowthDisabled: true,
 	})
 	// 包级可变量（测试专用「可置 0」开关）必须**在 Run 退净之后**才恢复：
 	// Run 里补跑那一批是独立的 goroutine，它在 log.Printf / time.Now / 各任务族
@@ -210,7 +206,6 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		KeepaliveHours:   []int{22},
 		TravelDisabled:   true,
 		ActivityDisabled: true,
-		BlackcatDisabled: true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, cst.Loc))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, cst.Loc); !at.Equal(want) {
@@ -272,7 +267,6 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		TravelDisabled:    true,
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
-		BlackcatDisabled:  true,
 		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
@@ -859,37 +853,10 @@ func TestPausedStillTravels(t *testing.T) {
 	}
 }
 
-// TestBlackcatEligibility 夜猫子只跑非禁用、非暂停的账号：RunNightChats 逐条发真实
-// glm-5.2 对话，是任务体系里唯一「整任务都是模型对话」的，与暂停号的「让位防风控」
-// 冲突。判据抽成纯函数后可在 23:00–08:00 窗口外直接测（RunBlackcatNow 有窗口前置判断）。
-func TestBlackcatEligibility(t *testing.T) {
-	cases := []struct {
-		name string
-		st   pool.Status
-		want bool
-	}{
-		{"正常账号", pool.Status{}, true},
-		{"暂停选号跳过", pool.Status{Paused: true}, false},
-		{"禁用跳过", pool.Status{Disabled: true}, false},
-		{"两者兼有", pool.Status{Disabled: true, Paused: true}, false},
-	}
-	for _, c := range cases {
-		if got := blackcatEligible(c.st); got != c.want {
-			t.Errorf("%s: blackcatEligible=%v want %v", c.name, got, c.want)
-		}
-	}
-}
-
-// TestMissedSlotsIsHostTimezoneIndependent 启动补跑的小时数按 CST（上游自然日）解释，
-// 与宿主机时区无关：CI runner 在 UTC，UTC 16:00–23:59 期间用宿主钟点取「上一小时」，
-// 那个时点在 CST 还是未来，补跑不触发（binaries #317 实测）。钉住「取当前时刻必须走
-// cst.Now()」。
-//
-// 宿主时区是**进程级**参数，所以这里用子进程注入 TZ=UTC 来模拟 UTC runner，而不是像
-// 旧版那样改写包级 time.Local。旧写法本身就是 DATA RACE 的写方：被它复跑的那条用例
-// 会留下仍在跑批次的 Run goroutine，goroutine 里的 time.Now()（log.Printf 内部也读它）
-// 在测试体返回后继续读这个全局，而 defer 恢复是先于 join 执行的。子进程方案在父进程里
-// 零全局写，等价性不变：子进程的 time.Local 就是 UTC，被测用例原样执行。
+// TestMissedSlotsIsHostTimezoneIndependent 把 time.Local 换成 UTC 再跑一遍启动补跑
+// 断言：排程的小时数按 CST 解释，CI runner 在 UTC，用宿主时钟取「上一小时」时
+// UTC 16:00 之后那个时点在 CST 还是未来，补跑不触发（binaries #317 实测）。
+// 钉住「取当前时刻必须走 cst.Now()」。
 func TestMissedSlotsIsHostTimezoneIndependent(t *testing.T) {
 	if os.Getenv(schedUTCHostEnv) == "1" {
 		// 子进程分支：宿主时区必须是 UTC，否则 TZ 注入失效、本用例失去意义。
