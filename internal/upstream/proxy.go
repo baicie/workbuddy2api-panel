@@ -15,5 +15,5 @@ func (c *Client) do(req *http.Request, a *auth.Auth, chat bool) (*http.Response,
 	if c.ProxyPool == nil || a == nil {
 		return client.Do(req)
 	}
-	return c.ProxyPool.Do(client, req, a.UID)
+	return c.ProxyPool.Do(client, req, a.UID, a.Realm())
 }
