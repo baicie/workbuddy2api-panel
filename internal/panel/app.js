@@ -573,7 +573,8 @@ function renderAccounts(list) {
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
-        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)
+        + (c.win_tokens ? '（本窗口 ' + c.win_tokens + ' tok）' : '')).join('\n');
     }
     const frozen = s.disabled || cool > 0;
     // 无个人成长体系的账号（企业版 / 静态 API Key）：签到与成长任务端点在上游对自己
@@ -1660,6 +1661,7 @@ const CFG_MAP = {
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   cost_explore_interval: ['pool', 'cost_explore_interval'],
+  balance_window: ['pool', 'balance_window'],
   credit_floor: ['pool', 'credit_floor'], credit_floor_max_rate: ['pool', 'credit_floor_max_rate'],
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
@@ -1776,7 +1778,7 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'balance_window', 'expiring_soon', 'ttl',
   'keepalive_refresh_window'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
@@ -2133,7 +2135,7 @@ function taskRowPresentation(t, caps) {
 
 // 可自动完成的任务（与后端 autoActions 表一致）：判据为行为事件、可经网关复现。
 // 其余任务需在官方客户端内交互，面板只展示指引（行 title 提示）。
-// 注意：键含点号（Model_chat_GLM5.2）必须加引号，否则会被解析成属性访问 + 数字字面量。
+// 注意：任务 code 可能含点号，键一律加引号，否则会被解析成属性访问 + 数字字面量。
 const AUTO_TASKS = {
   'chat_5': '上报 5 条对话活跃事件（自动补足差额）',
   'first_buddy': '上报解锁 → 同意协议 → 领取第一只 Buddy',

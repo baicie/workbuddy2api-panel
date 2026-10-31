@@ -4,13 +4,12 @@
 // （data/desktop-task-protocol.md）——
 //   - first_buddy（+300 分）：report（前置解锁）→ agreement → buddy/first
 //   - chat_5（+100 分）：累计 5 条 chat_request_send 上报
-//   - Model_chat_GLM5.2（+100 分）：accept → 用 glm-5.2 真实对话一次 → 上报（模型字段对齐）
 //   - RichMeow_Chat：桌面指纹（workbuddy-desktop）完整对话事件链，纯 API 可点亮（三账号实测）
-//   - Buddy_App / Buddy_App_QQ：buddyapp 五连事件，纯 API 可点亮（两账号实测）
+//   - Buddy_App：buddyapp 五连事件，纯 API 可点亮（两账号实测）
 //   - automation_1：automated_task_create_suc 事件，纯 API 可点亮（两账号实测）
 //   - Library_read：web 域 web_element_click(library_doc_intro_click)（三账号实测）
-//   - template_5 / playbook_prompt / create_canvas：asar 逆向出的判据事件
-//     （template_used / playbook_prompt_send / wbx_design_canvas_*），纯 API 可点亮（三账号实测）
+//   - template_5 / playbook_prompt：asar 逆向出的判据事件
+//     （template_used / playbook_prompt_send），纯 API 可点亮（三账号实测）
 //   - expert_5 / Expert_team_use_3：真实专家列表 + 召唤链 + 真实 chat（服务端 requestId）
 //   - expert_actual_use（三账号实测）
 //   - expert_use_* 系列（中国电商运营专家 / 抖音策略师 / 商家宣传页与海报设计师 / 直播电商教练）：
@@ -19,6 +18,8 @@
 //
 // 仍未破解：skill_1（疑似要求真实 Skill 工具调用）。
 // 不做：Expert_lighthouse（需真实连接器授权）、Expert_Philanthropy（真实捐款）。
+// 已下架（上游列表里没有，动作代码一并删除）：Model_chat_GLM5.2 / Buddy_App_QQ /
+// create_canvas / black_cat。
 //
 // 已领取任务不重复执行，已达标未领奖的任务只领奖，不重复消耗对话配额。
 package panel
