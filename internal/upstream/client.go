@@ -25,6 +25,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/cst"
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/loginsite"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/session"
 )
 
@@ -792,7 +793,8 @@ type apiEnvelope struct {
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
 type Client struct {
-	HTTP *http.Client
+	HTTP      *http.Client
+	ProxyPool *proxypool.Manager
 
 	// refreshMu 保护 refreshing/renewed 两张刷新表：
 	//   refreshing 同一个 refresh token 的在途刷新（并发调用共享结果）；
@@ -1191,8 +1193,8 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1402,7 +1404,7 @@ func (c *Client) doRefresh(a *auth.Auth, rtSnapshot string) *refreshResult {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return &refreshResult{err: err, at: time.Now()}
 	}
@@ -1574,7 +1576,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
 		doStart := time.Now()
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := c.do(req, a, true)
 		if timing != nil {
 			timing.Do += max(time.Since(doStart), time.Nanosecond)
 		}
@@ -1914,7 +1916,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2396,7 +2398,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		ua = c.v3ProbeUA(a)
 	}
 	req.Header.Set("User-Agent", ua)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.do(req, a, false)
 	if err != nil {
 		return nil, nil, err
 	}

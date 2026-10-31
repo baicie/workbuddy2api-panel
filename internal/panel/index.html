@@ -182,6 +182,29 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 input.invalid { border-color: var(--bad); background: var(--bad-soft); }
 input.invalid:focus { border-color: var(--bad); }
 input[type=checkbox] { width: auto; accent-color: var(--accent); }
+.account-proxy { margin-top: 7px; max-width: 190px; }
+.account-proxy select { padding: 3px 6px; font-size: 11.5px; min-height: 28px; }
+.proxy-binding-error { display: block; color: var(--bad); font-size: 11.5px; margin-top: 3px; }
+.proxy-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 18px; }
+.proxy-toolbar .note { flex: 1; min-width: 160px; }
+.proxy-section { border-top: 1px solid var(--line); padding: 16px 0; }
+.proxy-section summary { cursor: pointer; font-weight: 600; }
+.proxy-section textarea { display: block; width: 100%; height: 150px; resize: vertical; margin: 14px 0 10px; font: 13px/1.7 var(--mono); color: var(--ink); background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 10px; }
+.proxy-section label { display: block; font-size: 12.5px; color: var(--ink-2); }
+.proxy-section label input { margin-top: 5px; }
+.proxy-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 16px 0; }
+.proxy-fields .wide { grid-column: 1 / -1; }
+.proxy-actions { display: flex; align-items: center; gap: 8px; }
+.proxy-actions button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.proxy-actions svg { width: 15px; height: 15px; flex: none; }
+.proxy-result { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; margin-top: 10px; color: var(--ink-2); }
+.proxy-table { min-width: 980px; }
+.proxy-table .proxy-address { max-width: 260px; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; }
+.proxy-table .proxy-error { max-width: 230px; overflow-wrap: anywhere; color: var(--ink-2); font-size: 12px; }
+.proxy-table .proxy-name { max-width: 180px; overflow-wrap: anywhere; }
+.proxy-pagination { display: flex; align-items: center; justify-content: flex-end; gap: 12px; padding-top: 14px; }
+@media (max-width: 700px) { .proxy-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 420px) { .proxy-fields { grid-template-columns: minmax(0, 1fr); } }
 label.fld { display: block; margin-bottom: 14px; }
 label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
 label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
@@ -780,6 +803,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#proxies" data-view="proxies">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-4h14v4M12 12V8"/></svg>
+        代理池</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -909,6 +935,59 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </table>
         </div>
       </div>
+    </section>
+
+    <section class="view" id="view-proxies" hidden>
+      <div class="proxy-toolbar">
+        <span class="note" id="proxySummary" role="status">读取中…</span>
+        <div class="proxy-actions">
+          <button type="button" id="proxyCheckAll"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>全部检测</button>
+          <button type="button" class="primary" id="proxyAdd"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>添加代理</button>
+        </div>
+      </div>
+      <details class="proxy-section" id="proxyImportPanel">
+        <summary>批量添加</summary>
+        <label for="proxyLines">代理地址（每行一个）</label>
+        <textarea id="proxyLines" spellcheck="false" placeholder="http://HOST:8080&#10;https://USER:PASSWORD@HOST:443&#10;socks5://HOST:1080&#10;socks5h://HOST:1080"></textarea>
+        <button type="button" class="primary" id="proxyImport">添加</button>
+        <div class="proxy-result" id="proxyImportResults" role="status"></div>
+      </details>
+      <section class="proxy-section" id="proxyEditor" hidden aria-label="编辑代理">
+        <h3>编辑代理</h3>
+        <div class="proxy-fields">
+          <label>名称<input id="proxyName" maxlength="128"></label>
+          <label class="wide">代理地址<input id="proxyURL" spellcheck="false" autocomplete="off"></label>
+          <label>密码<input id="proxyPassword" type="password" autocomplete="new-password" placeholder="留空保持原值"></label>
+        </div>
+        <div class="proxy-actions">
+          <button type="button" class="primary" id="proxySave">保存</button>
+          <button type="button" id="proxyCancel">取消</button>
+        </div>
+      </section>
+      <div class="proxy-section">
+        <div class="tbl-wrap">
+          <table class="acc proxy-table">
+            <thead><tr><th>名称 / 协议</th><th>地址</th><th>状态</th><th class="num">延迟</th><th>最近检测</th><th>错误</th><th class="num">绑定数</th><th>启用</th><th>操作</th></tr></thead>
+            <tbody id="proxyBody"><tr><td colspan="9"><div class="empty">读取中…</div></td></tr></tbody>
+          </table>
+        </div>
+        <div class="proxy-pagination">
+          <button type="button" class="icon" id="proxyPrev" title="上一页" aria-label="上一页"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg></button>
+          <span class="note" id="proxyPage">1 / 1</span>
+          <button type="button" class="icon" id="proxyNext" title="下一页" aria-label="下一页"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></button>
+        </div>
+      </div>
+      <details class="proxy-section" id="proxyHealthPanel">
+        <summary>自动测活设置</summary>
+        <div class="proxy-fields" id="proxyHealthFields">
+          <label class="wide">检测 URL<input id="proxyHealthURL" type="url"></label>
+          <label>检测间隔（秒）<input id="proxyInterval" type="number" min="1" max="86400" value="60"></label>
+          <label>超时（秒）<input id="proxyTimeout" type="number" min="1" max="300" value="10"></label>
+          <label>连续失败禁用次数<input id="proxyFailures" type="number" min="1" max="100" value="3"></label>
+          <label>连续成功恢复次数<input id="proxySuccesses" type="number" min="1" max="100" value="2"></label>
+        </div>
+        <button type="button" class="primary" id="proxyHealthSave">保存设置</button>
+      </details>
     </section>
 
     <!-- 任务中心：后台自动任务的进展与待办扫描/队列共用一张卡、一个列表

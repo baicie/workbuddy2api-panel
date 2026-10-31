@@ -28,6 +28,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
@@ -208,6 +209,13 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	proxies, err := proxypool.New(stateSibling(cfg.StateFile, "proxy-pool.json"),
+		up.HTTP.Transport.(*http.Transport), upstream.NewDNSDialer(cfg.DNSServers))
+	if err != nil {
+		log.Fatalf("proxy pool: %v", err)
+	}
+	defer proxies.Close()
+	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
 	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
@@ -416,6 +424,7 @@ func main() {
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
+		ProxyPool:  proxies,
 		Usage:      rec,
 		RequestLog: requestLog,
 		Upstream:   up,
@@ -521,6 +530,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	proxyCtx, stopProxies := context.WithCancel(ctx)
+	proxyDone := make(chan struct{})
+	go func() {
+		defer close(proxyDone)
+		proxies.Run(proxyCtx)
+	}()
+	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
