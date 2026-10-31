@@ -1469,7 +1469,7 @@ const ctx = {
   esc: (s) => String(s),
 };
 vm.createContext(ctx);
-vm.runInContext("'use strict';\n" + src.slice(start) + '\nthis.loadPackages = loadPackages;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, src.indexOf('const PROXY_STATES', start)) + '\nthis.loadPackages = loadPackages;', ctx);
 (async () => {
   await ctx.loadPackages();                       // 冷：首次进入 → 打上游
   const cold = { calls: calls.length, rendered: rendered.slice() };

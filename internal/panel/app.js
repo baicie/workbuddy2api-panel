@@ -4,6 +4,7 @@ const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 /* 账号备注的本机键（模块级声明放顶部，避开 TDZ）。 */
 const LS_REMARKS = 'wb2api.remarks.v1';
 let remarksCache = null;
+let proxyData = null, proxyPage = 1, proxyLoading = false, proxyEditID = null, proxySettingsDirty = false;
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null, updateData = null, updateBusy = false;
@@ -449,7 +450,7 @@ $('btnLogout').onclick = () => {
 };
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
+const TITLES = { accounts: '账号池', proxies: '代理池', usage: '用量', packages: '积分构成', balhist: '余额趋势', taskscenter: '任务中心', models: '模型与档位', config: '配置', events: '请求事件日志', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -458,6 +459,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
+  if (v === 'proxies') loadProxies();
   // 切到日志视图：本地窗口为空（首次）时全量拉一次；已有窗口则继续增量。
   // 注意**不要**在每次切视图时 resetLogWindow()——那会把增量游标清掉，下一轮
   // 又变成全量拉，白白丢掉增量带来的收益。
@@ -486,6 +488,7 @@ let lastAccountsList = [];
 
 function renderAccounts(list) {
   lastAccountsList = Array.isArray(list) ? list : [];
+  if (document.activeElement?.matches?.('[data-proxy-uid]')) return;
   const tb = $('accBody');
   const total = lastAccountsList.length;
   const globalCnt = lastAccountsList.filter(s => s.realm === 'global').length;
@@ -594,7 +597,7 @@ function renderAccounts(list) {
       (s.api_key ? ' <span class="realm-tag">API Key</span>' : '');
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm"><span class="nm-name" title="' + esc(rawWho) + '">' + nameHtml + '</span>' + tags + '</div><div class="id" title="uid: ' + esc(s.uid) + '">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm"><span class="nm-name" title="' + esc(rawWho) + '">' + nameHtml + '</span>' + tags + '</div><div class="id" title="uid: ' + esc(s.uid) + '">' + esc(short) + '</div>' + accountProxyHTML(s.uid) + '</td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -746,6 +749,7 @@ async function loadOverview(quiet) {
   try {
     const d = await api('overview');
     overviewData = d;
+    if (d.proxy_pool) proxyData = d.proxy_pool;
     // 应用服务端透出的自动刷新间隔（首轮 overview 之后即生效；后续不变则不重建表）。
     if (d.poll_interval_sec !== undefined && d.poll_interval_sec !== null) {
       const sec = Number(d.poll_interval_sec);
@@ -2015,6 +2019,7 @@ $('importFile').onchange = async () => {
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
+  if (view === 'proxies') { await loadProxies(); return; }
   const b = $('btnRefresh');
   b.disabled = true; b.title = '刷新中…';
   try {
@@ -2060,6 +2065,7 @@ function refreshVisible() {
     loadOverview(true);
   }
   else if (view === 'logs') loadLogs();
+  else if (view === 'proxies') loadProxies(true);
   else if (view === 'taskscenter') reattachQueueView();
 }
 // startPolling（重）建轮询定时器。间隔取 pollIntervalMs（服务端配置可调）；
@@ -5047,4 +5053,198 @@ if ($('btnEventExport')) $('btnEventExport').onclick = () => {
   a.download = 'request-events-' + new Date().toISOString().slice(0, 10) + '.json';
   a.click();
   URL.revokeObjectURL(url);
+};
+
+const PROXY_STATES = { pending: ['warn', '待检测'], healthy: ['ok', '可用'], unhealthy: ['bad', '自动禁用'], disabled: ['bad', '手动禁用'] };
+function accountProxyHTML(uid) {
+  if (!proxyData) return '';
+  const binding = proxyData.bindings?.[uid] || { mode: 'random' };
+  const selected = binding.mode === 'fixed' ? (proxyData.proxies || []).find(p => p.id === binding.proxy_id) : null;
+  return '<div class="account-proxy"><select aria-label="账号代理" data-proxy-uid="' + esc(uid) + '">' +
+    '<option value="random"' + (binding.mode === 'random' ? ' selected' : '') + '>默认随机</option>' +
+    '<option value="direct"' + (binding.mode === 'direct' ? ' selected' : '') + '>直连</option>' +
+    (selected ? '<option selected value="' + esc(selected.id) + '">' + esc(selected.name) + '</option>' : '') +
+    '</select>' + (binding.mode === 'fixed' && selected?.status !== 'healthy' ? '<span class="proxy-binding-error">绑定代理不可用</span>' : '') + '</div>';
+}
+
+function populateProxySelect(select) {
+  if (!proxyData) return;
+  const current = select.value;
+  select.innerHTML = '<option value="random">默认随机</option><option value="direct">直连</option>' +
+    (proxyData.proxies || []).map(p => '<option value="' + esc(p.id) + '">' + esc(p.name + ' · ' + (PROXY_STATES[p.status]?.[1] || p.status)) + '</option>').join('');
+  select.value = current;
+}
+$('accBody').addEventListener('focusin', ev => {
+  if (ev.target.matches('[data-proxy-uid]')) populateProxySelect(ev.target);
+});
+$('accBody').addEventListener('change', async ev => {
+  const select = ev.target;
+  if (!select.matches('[data-proxy-uid]')) return;
+  const uid = select.dataset.proxyUid, value = select.value;
+  const hadFocus = document.activeElement === select;
+  select.disabled = true;
+  try {
+    const body = value === 'random' || value === 'direct' ? { mode: value } : { mode: 'fixed', proxy_id: value };
+    await api('accounts/' + encodeURIComponent(uid) + '/proxy', { method: 'PUT', body: JSON.stringify(body) });
+    toast('账号代理已保存', 'ok');
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally {
+    select.disabled = false;
+    const restoreFocus = hadFocus && (document.activeElement === select || document.activeElement === document.body);
+    if (restoreFocus) select.blur();
+    await loadOverview(true);
+    if (restoreFocus) {
+      [...$('accBody').querySelectorAll('[data-proxy-uid]')].find(el => el.dataset.proxyUid === uid)?.focus();
+    }
+  }
+});
+
+function proxyIcon(name) {
+  const paths = {
+    check: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+    edit: '<path d="m16 3 5 5M4 20l4-1L21 6a2.1 2.1 0 0 0-3-3L5 16z"/>',
+    remove: '<path d="M3 6h18M9 6V4h6v2M5 6l1 14h12l1-14M10 10v6M14 10v6"/>',
+  };
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">' + paths[name] + '</svg>';
+}
+function renderProxies() {
+  if (!proxyData) return;
+  const list = proxyData.proxies || [], pages = Math.max(1, Math.ceil(list.length / 25));
+  proxyPage = Math.max(1, Math.min(proxyPage, pages));
+  const healthy = list.filter(p => p.status === 'healthy').length;
+  $('proxySummary').textContent = list.length + ' 个代理 · ' + healthy + ' 个可用';
+  $('proxyPage').textContent = proxyPage + ' / ' + pages;
+  $('proxyPrev').disabled = proxyPage === 1;
+  $('proxyNext').disabled = proxyPage === pages;
+  $('proxyCheckAll').disabled = !list.length;
+  setHTML($('proxyBody'), list.length ? list.slice((proxyPage - 1) * 25, proxyPage * 25).map(p => {
+    const [tone, text] = PROXY_STATES[p.status] || ['warn', p.status];
+    const action = (type, label, disabled = false) => '<button class="icon ghost' + (type === 'remove' ? ' danger' : '') + '" data-proxy-action="' + type + '" data-id="' + esc(p.id) + '" title="' + esc(label) + '" aria-label="' + esc(label + ' ' + p.name) + '"' + (disabled ? ' disabled' : '') + '>' + proxyIcon(type) + '</button>';
+    return '<tr><td class="proxy-name"><b>' + esc(p.name) + '</b><div class="note">' + esc(p.protocol.toUpperCase()) + '</div></td>' +
+      '<td class="proxy-address">' + esc(p.url) + (p.password_set ? '<div class="note">已设置密码</div>' : '') + '</td>' +
+      '<td><span class="tag ' + tone + '">' + (p.checking ? '检测中' : esc(text)) + '</span></td>' +
+      '<td class="num">' + (p.checked_at && !p.checked_at.startsWith('0001-') ? p.latency_ms + ' ms' : '—') + '</td>' +
+      '<td class="note">' + (p.checked_at && !p.checked_at.startsWith('0001-') ? esc(fmtLocalDateTime(p.checked_at)) : '—') + '</td>' +
+      '<td class="proxy-error">' + esc(p.last_error || '—') + '</td><td class="num">' + p.bound_count + '</td>' +
+      '<td><input type="checkbox" data-proxy-toggle="' + esc(p.id) + '" aria-label="' + esc('启用 ' + p.name) + '"' + (p.enabled ? ' checked' : '') + '></td>' +
+      '<td><div class="proxy-actions">' + action('check', '检测', p.checking) + action('edit', '编辑') + action('remove', p.bound_count ? '先解除账号绑定' : '删除', p.bound_count > 0) + '</div></td></tr>';
+  }).join('') : '<tr><td colspan="9"><div class="empty">代理池为空</div></td></tr>');
+  if (!proxySettingsDirty) {
+    const s = proxyData.health;
+    $('proxyHealthURL').value = s.url;
+    $('proxyInterval').value = s.interval_seconds;
+    $('proxyTimeout').value = s.timeout_seconds;
+    $('proxyFailures').value = s.failure_threshold;
+    $('proxySuccesses').value = s.success_threshold;
+  }
+}
+async function loadProxies(quiet = false) {
+  if (proxyLoading) return;
+  proxyLoading = true;
+  try {
+    proxyData = await api('proxies');
+    renderProxies();
+  } catch (e) {
+    $('proxySummary').textContent = '读取失败：' + e.message;
+    if (!quiet) toast(e.message, 'err');
+  } finally { proxyLoading = false; }
+}
+$('proxyAdd').onclick = () => {
+  $('proxyImportPanel').open = true;
+  $('proxyLines').focus();
+};
+$('proxyPrev').onclick = () => { proxyPage--; renderProxies(); };
+$('proxyNext').onclick = () => { proxyPage++; renderProxies(); };
+$('proxyImport').onclick = async () => {
+  const button = $('proxyImport'), lines = $('proxyLines').value;
+  if (!lines.trim()) { $('proxyLines').focus(); return; }
+  button.disabled = true;
+  try {
+    const data = await api('proxies', { method: 'POST', body: JSON.stringify({ lines }) });
+    const rows = data.results || [];
+    $('proxyImportResults').textContent = '添加 ' + rows.filter(r => r.status === 'added').length + ' 个 · 重复 ' + rows.filter(r => r.status === 'duplicate').length + ' 个 · 无效 ' + rows.filter(r => r.status === 'invalid').length + ' 个' +
+      rows.filter(r => r.status === 'invalid').map(r => '\n第 ' + r.line + ' 行：' + r.error).join('');
+    const inputLines = lines.split('\n');
+    $('proxyLines').value = rows.filter(r => r.status === 'invalid').map(r => inputLines[r.line - 1]).join('\n');
+    await loadProxies();
+  } catch (e) { toast('添加失败：' + e.message, 'err'); }
+  finally { button.disabled = false; }
+};
+$('proxyCheckAll').onclick = async () => {
+  const button = $('proxyCheckAll');
+  button.disabled = true;
+  try { await api('proxies/check', { method: 'POST' }); toast('检测已排队', 'ok'); await loadProxies(); }
+  catch (e) { toast(e.message, 'err'); }
+  finally { button.disabled = false; }
+};
+$('proxyBody').addEventListener('click', async ev => {
+  const button = ev.target.closest('button[data-proxy-action]');
+  if (!button) return;
+  const { id, proxyAction: action } = button.dataset;
+  const item = proxyData?.proxies.find(p => p.id === id);
+  if (!item) return;
+  if (action === 'edit') {
+    proxyEditID = id;
+    $('proxyName').value = item.name;
+    $('proxyURL').value = item.url;
+    $('proxyPassword').value = '';
+    $('proxyEditor').hidden = false;
+    $('proxyName').focus();
+    return;
+  }
+  button.disabled = true;
+  try {
+    await api('proxies/' + encodeURIComponent(id) + (action === 'check' ? '/check' : ''), { method: action === 'check' ? 'POST' : 'DELETE' });
+    if (action === 'remove' && proxyEditID === id) { proxyEditID = null; $('proxyEditor').hidden = true; }
+    toast(action === 'check' ? '检测已排队' : '代理已删除', 'ok');
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { button.disabled = false; }
+});
+$('proxyBody').addEventListener('change', async ev => {
+  const input = ev.target;
+  if (!input.matches('[data-proxy-toggle]')) return;
+  input.disabled = true;
+  try {
+    await api('proxies/' + encodeURIComponent(input.dataset.proxyToggle), { method: 'PATCH', body: JSON.stringify({ enabled: input.checked }) });
+    await loadProxies();
+  } catch (e) { input.checked = !input.checked; toast(e.message, 'err'); }
+  finally { input.disabled = false; }
+});
+$('proxyCancel').onclick = () => {
+  const id = proxyEditID;
+  proxyEditID = null;
+  $('proxyEditor').hidden = true;
+  $('proxyPassword').value = '';
+  const origin = [...$('proxyBody').querySelectorAll('[data-proxy-action="edit"]')].find(el => el.dataset.id === id);
+  (origin || $('proxyAdd')).focus();
+};
+$('proxySave').onclick = async () => {
+  if (!proxyEditID) return;
+  const button = $('proxySave');
+  button.disabled = true;
+  try {
+    await api('proxies/' + encodeURIComponent(proxyEditID), { method: 'PATCH', body: JSON.stringify({
+      name: $('proxyName').value, url: $('proxyURL').value, password: $('proxyPassword').value,
+    }) });
+    await loadProxies();
+    $('proxyCancel').click();
+    toast('代理已保存', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+  finally { button.disabled = false; }
+};
+$('proxyHealthFields').addEventListener('input', () => { proxySettingsDirty = true; });
+$('proxyHealthSave').onclick = async () => {
+  const button = $('proxyHealthSave');
+  button.disabled = true;
+  try {
+    await api('proxies/health', { method: 'PUT', body: JSON.stringify({
+      url: $('proxyHealthURL').value, interval_seconds: Number($('proxyInterval').value), timeout_seconds: Number($('proxyTimeout').value),
+      failure_threshold: Number($('proxyFailures').value), success_threshold: Number($('proxySuccesses').value),
+    }) });
+    proxySettingsDirty = false;
+    toast('测活设置已保存', 'ok');
+    await loadProxies();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { button.disabled = false; }
 };
