@@ -113,6 +113,7 @@
     "account_priority": {},
     "account_share": {},
     "cost_explore_interval": "30m",
+    "balance_window": "1h",
     "credit_floor": 100,
     "reserve_credits": 10,
     "model_fallback": {}

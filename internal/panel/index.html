@@ -1283,7 +1283,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">账号摊开窗口（分钟）</span>
                 <input name="account_spread_minutes" type="number" min="0" max="1440" placeholder="0">
-                <span class="hint">0 = 关闭（同一秒打全池）。&gt;0 时签到 / 旅行 / 活跃上报 / 保活 / 夜猫子把账号错开在窗口内各自的时刻。手动触发不受影响。窗口应小于相邻时点间隔。</span></label>
+                <span class="hint">0 = 关闭（同一秒打全池）。&gt;0 时签到 / 旅行 / 活跃上报 / 保活把账号错开在窗口内各自的时刻。手动触发不受影响。窗口应小于相邻时点间隔。</span></label>
               <label class="fld"><span class="lb">账号最小间隔（秒）</span>
                 <input name="account_spread_min_gap_seconds" type="number" min="0" max="3600" placeholder="0">
                 <span class="hint">0 = 只做随机。两个账号撞在同一时段时把后者推开；账号数 × 该值接近窗口时末尾会挤在一起。</span></label>
@@ -1348,6 +1348,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">成本探索窗口</span>
                 <input name="cost_explore_interval" placeholder="30m">
                 <span class="hint">垄断破除：免费层垄断时定期搭车探索未知号；0 关停</span></label>
+              <label class="fld"><span class="lb">用量均衡窗口</span>
+                <input name="balance_window" placeholder="1h">
+                <span class="hint">按账号在该模型窗口内的 token 用量反比降权，把热点号打散；0 关停</span></label>
               <label class="fld"><span class="lb">积分保底</span>
                 <input name="credit_floor" type="number" min="0" placeholder="100">
                 <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
@@ -1711,10 +1714,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="realm-row">
             <span class="hint" style="font-size:12px">站点：</span>
             <label class="realm-opt"><input type="radio" name="addSite" value="cn" checked> 国内版（CN）</label>
-            <label class="realm-opt"><input type="radio" name="addSite" value="intl"> 国际版（Global）</label>
-            <label class="realm-opt"><input type="radio" name="addSite" value="workbuddy"> 国际版（旧桌面端）</label>
+            <label class="realm-opt"><input type="radio" name="addSite" value="workbuddy"> 国际版（Global）</label>
           </div>
-          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。「旧桌面端」仅用于已注册在 workbuddy.ai 的老账号，新账号请选国际版。</div>
+          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。（走 www.workbuddy.ai 桌面端口径）</div>
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
