@@ -131,8 +131,11 @@ func (p *Panel) reloginStart(w http.ResponseWriter, r *http.Request) {
 	defer release()
 
 	// 发起设备授权（端点随目标账号的 realm 切换，与添加账号同源）。
-	epState, _, _, origin := loginEndpoints(realm)
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	// 2026-10-31 上游把 doJSON 的第 3/5 参数改成「头族 map + loginSite」，
+	// 这里跟着 loginStart 的写法对齐（x-device-token / x-no-* 一整套头）。
+	site := siteForRealm(realm)
+	epState, _, _, _ := loginEndpointsFor(site)
+	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), bytes.NewReader([]byte("{}")), site)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
