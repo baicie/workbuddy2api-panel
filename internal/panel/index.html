@@ -359,7 +359,10 @@ td.acts { display: table-cell; vertical-align: middle; text-align: right; }
    缺哪个留空槽。否则「解冻 / 暂停选号 / 恢复选号」互斥会改变按钮个数，整列左右错位。
    分列放在内层 div：td 保持 table-cell，vertical-align:middle 才继续生效
    （直接给 td 设 display:grid 会退出表格布局，按钮变顶对齐）。 */
-.acts-inner { display: grid; grid-template-columns: repeat(4, 54px) 68px repeat(3, 54px); gap: 5px; justify-content: end; align-items: center; }
+.acts-inner { display: grid; grid-template-columns: repeat(3, 54px) 68px repeat(3, 54px); gap: 5px; justify-content: end; align-items: center; }
+/* 「探活」只在整表有冻结账号时才渲染；没有就整列不占位 —— 否则 29 行每行都在
+   「任务」和「暂停选号」之间空出一条 64px 的缝（用户反馈「中间留白难受」）。 */
+.acts-inner.with-probe { grid-template-columns: repeat(4, 54px) 68px repeat(3, 54px); }
 /* 统一盒模型：primary 与 ghost 的边框/行高不同会让「解冻」行比「暂停选号」行高 2~3px，
    行线因此参差。固定高度 + border-box 后每行等高、按钮底边对齐。 */
 .acts-inner button { width: 100%; height: 26px; box-sizing: border-box; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -783,6 +786,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .executor-name { font-weight: 600; color: var(--ink); font-size: 12px; }
 .ip-mono { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--ink-2); }
 .ua-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--ink-3); cursor: help; }
+/* 请求上下文弹窗：一条消息一块，长文 pre-wrap，纵向滚动交给 .dlg .body。 */
+#eventTableBody tr[data-ev] { cursor: pointer; }
+.ev-ctx { padding: 2px 0; display: flex; flex-direction: column; gap: 10px; }
+.ev-ctx-msg { display: grid; grid-template-columns: 76px 1fr; gap: 10px; align-items: start; }
+.ev-ctx-role { font-size: 11px; font-weight: 600; color: var(--ink-3); text-transform: uppercase; letter-spacing: .04em; padding-top: 3px; }
+.ev-ctx-msg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace; font-size: 12px; line-height: 1.55; color: var(--ink); }
+.ev-ctx-empty { padding: 10px 12px; font-size: 12px; color: var(--ink-3); }
 
 </style>
 </head>
@@ -887,6 +897,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <tbody id="expBody"></tbody>
         </table>
         </div>
+        <!-- 跨账号合计（issue #102）：同一份快照按自然日累加「该日到期」，
+             一行一个到期日；只合计到期量，日均需耗跨号相加没有意义故不列。
+             混域时按 cn/global 分行——两域积分不同源。 -->
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>跨账号合计 · 到期日</th><th class="num">距到期</th>
+            <th class="num">该日到期</th><th class="num">账号数</th>
+          </tr></thead>
+          <tbody id="expTotalBody"></tbody>
+        </table>
+        </div>
       </div>
 
       <div class="box">
@@ -977,6 +999,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="button" class="icon" id="proxyNext" title="下一页" aria-label="下一页"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 18 6-6-6-6"/></svg></button>
         </div>
       </div>
+      <!-- realm 级默认出口（issue #39 P3）：账号行没显式绑定时取这里 -->
+      <details class="proxy-section" id="proxyRealmPanel">
+        <summary>分区默认出口</summary>
+        <div class="proxy-fields">
+          <label>国内版（cn）<select id="proxyRealmCn"></select></label>
+          <label>国际版（global）<select id="proxyRealmGlobal"></select></label>
+        </div>
+        <div class="note">只对没在账号行单独指定代理的账号生效（账号绑定优先）；留「默认随机」= 从可用代理里挑。</div>
+      </details>
       <details class="proxy-section" id="proxyHealthPanel">
         <summary>自动测活设置</summary>
         <div class="proxy-fields" id="proxyHealthFields">
@@ -1329,6 +1360,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <label class="fld"><span class="lb">上报时点（小时，逗号分隔）</span>
                   <input name="activity_hours" placeholder="10">
                   <span class="hint">点亮连登 + 解锁领养前置</span></label>
+                <div class="switch"><span class="lb">国际版网页会话腿</span>
+                  <input type="checkbox" name="web_activity_enabled">
+                  <span class="hint">默认关：每日 30 积分靠上报即到账，网页会话非必需</span></div>
               </div>
             </div>
             <div class="hr"></div>
@@ -1496,6 +1530,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">提示词文件路径</span>
                 <input name="prompt_file" placeholder="留空 = 内置默认提示词">
                 <span class="hint">需重启</span></label>
+              <label class="fld"><span class="lb">只保留最近 N 轮对话</span>
+                <input name="keep_recent_rounds" type="number" min="0" placeholder="0 = 不裁剪（默认）">
+                <span class="hint">出站前丢掉更早的 user / assistant / tool 消息，system 全留；一轮 = 一条 user 消息。省输入 token，代价是模型看不到更早的上下文。保存即热生效，0 关闭。</span></label>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>
@@ -1541,6 +1578,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="request_client_info"></div>
             <div class="hint">开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；
               关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。</div>
+            <div class="switch" style="margin-top:10px"><span class="lb">记录请求上下文（system / messages 原文）</span>
+              <input type="checkbox" name="request_archive_context"></div>
+            <div class="hint">开启后，「请求事件日志」点任意一行可展开当轮发出去的提示词与消息。这是<strong>用户数据</strong>：
+              会以明文写进归档文件（保留 7 天），仅在排查「上游为什么拒这条请求」时临时打开。</div>
             <div class="hint" style="margin-top:8px">归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。</div>
           </div>
         </div>
@@ -1854,6 +1895,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <div id="toasts"></div>
+
+<!-- 请求上下文：从请求事件日志点行打开。内容可能很长，交给 .dlg .body 滚动，
+     不挤占表格高度（原来内嵌展开会把整张表往下推）。 -->
+<div class="veil" id="evCtxVeil">
+  <div class="dlg" style="width:880px">
+    <header>
+      <h3>请求上下文</h3>
+      <div class="hint" id="evCtxHint"></div>
+    </header>
+    <div class="body" id="evCtxBody"></div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnEvCtxClose">关闭</button>
+    </footer>
+  </div>
+</div>
 
 <!-- 账号备注：只写本机 localStorage，不写回服务器；账号池与用量两个视图同步显示 -->
 <div class="veil" id="remarkVeil">

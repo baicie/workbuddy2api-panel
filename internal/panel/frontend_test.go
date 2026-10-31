@@ -1866,6 +1866,7 @@ if (start < 0 || end < 0) throw new Error('expiry snapshot helpers not found');
 const ctx = {
   Number, String, Array, Date, Math, JSON, PK_DAY_MS: 86400000,
   expBody: { innerHTML: '', querySelector: () => null }, expNote: { textContent: '' },
+  expTotalBody: { innerHTML: '' },
   esc: s => String(s), fmtTok: n => String(n),
   pkExpiryDateTime: ms => new Date(ms).toISOString(),
 };
@@ -1891,19 +1892,37 @@ ctx.renderExpirySnapshot({
     { uid: 'a', nickname: 'A', credits_expiry_buckets: [{ date: day(3), remain: 150 }] },
   ],
 });
-const buckets = { html: ctx.expBody.innerHTML, note: ctx.expNote.textContent };
+const buckets = { html: ctx.expBody.innerHTML, note: ctx.expNote.textContent,
+  tot: ctx.expTotalBody.innerHTML };
 ctx.renderExpirySnapshot({
   accounts: [{ uid: 'c', nickname: 'C',
     credits_earliest_expiry: new Date(Date.now() + 3 * 86400000).toISOString(),
     credits_earliest_remaining: 77 }],
 });
+const fb = ctx.expBody.innerHTML.includes('77');  // 后面还要渲混域快照，先取
+// 跨账号合计（issue #102）：两个号在 day(3) 各自到期 120/150 → 一行 270 / 2 个号；
+// day(5) 只有 B 的 300 → 1 个号。同域不拆，不出现域标签。
+const tot = buckets.tot;
+const rowsOf = html => (html.match(/<tr>/g) || []).length;
+const cellsOf = html => (html.match(/<td/g) || []).length;
+// 混域：同一份快照里 cn 与 global 必须分行合计，不能加成一笔。
+ctx.renderExpirySnapshot({ accounts: [
+  { uid: 'x', realm: 'cn', credits_expiry_buckets: [{ date: day(3), remain: 100 }] },
+  { uid: 'y', realm: 'global', credits_expiry_buckets: [{ date: day(3), remain: 40 }] },
+] });
+const mixed = ctx.expTotalBody.innerHTML;
 process.stdout.write(JSON.stringify({
   order: buckets.html.indexOf('>A<') >= 0 && buckets.html.indexOf('>A<') < buckets.html.indexOf('>B<'),
   hasRest: buckets.html.includes('随后'),
   weekSum: buckets.html.includes('7 天内合计 420'),
   dayLabel: buckets.html.includes('3 天'),
   note: buckets.note,
-  fallback: ctx.expBody.innerHTML.includes('77'),
+  fallback: fb,
+  totRows: rowsOf(tot), totCells: cellsOf(tot),
+  totDay3: tot.includes('>270<') && tot.includes('>2<'), totDay5: tot.includes('>300<'),
+  totNoRealm: !tot.includes('国内版'),
+  mixedRows: rowsOf(mixed), mixedSplit: mixed.includes('100') && mixed.includes('40') &&
+    !mixed.includes('140'),
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "expiry-snapshot-*.cjs")
 	if err != nil {
@@ -1920,6 +1939,8 @@ process.stdout.write(JSON.stringify({
 	got := strings.TrimSpace(string(out))
 	for _, want := range []string{
 		`"order":true`, `"hasRest":true`, `"weekSum":true`, `"dayLabel":true`, `"fallback":true`,
+		`"totRows":2`, `"totCells":8`, `"totDay3":true`, `"totDay5":true`, `"totNoRealm":true`,
+		`"mixedRows":2`, `"mixedSplit":true`,
 		`每 5 分钟后台刷新`, `2 个账号有未到期批次`,
 	} {
 		if !strings.Contains(got, want) {

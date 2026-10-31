@@ -207,7 +207,7 @@ func TestRoutingRandomFixedDirectAndRedirect(t *testing.T) {
 	defer direct.Close()
 	request := func(uid string) (string, error) {
 		req, _ := http.NewRequest("GET", direct.URL, nil)
-		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, uid)
+		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, uid, "cn")
 		if err != nil {
 			return "", err
 		}
@@ -262,7 +262,7 @@ func TestRoutingRandomFixedDirectAndRedirect(t *testing.T) {
 	}
 	for range 10 {
 		req, _ := http.NewRequest("GET", "http://destination.invalid/redirect", nil)
-		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u")
+		resp, err := m.Do(&http.Client{Timeout: time.Second}, req, "u", "cn")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -371,7 +371,7 @@ func TestProxyResponseErrorsRetainIdentityAndCancellation(t *testing.T) {
 	id := addProxy(t, m, proxy.URL)
 	probe(t, m, id)
 	req, _ := http.NewRequest("GET", "http://origin.invalid/truncated", nil)
-	resp, err := m.Do(http.DefaultClient, req, "u1")
+	resp, err := m.Do(http.DefaultClient, req, "u1", "cn")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +383,7 @@ func TestProxyResponseErrorsRetainIdentityAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req, _ = http.NewRequestWithContext(ctx, "GET", "http://origin.invalid/", nil)
-	_, err = m.Do(http.DefaultClient, req, "u1")
+	_, err = m.Do(http.DefaultClient, req, "u1", "cn")
 	if !IsError(err) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation lost proxy identity or cause: %v", err)
 	}

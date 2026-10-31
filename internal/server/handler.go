@@ -106,6 +106,11 @@ type Config struct {
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
 
+	// RecordContext 是否把会话上下文（system + messages）记入请求事件。
+	// 来自 logging.request_archive_context（缺省 false）：提示词是用户数据，
+	// 默认不落盘。热生效，经 livecfg 快照。
+	RecordContext bool
+
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
@@ -123,6 +128,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:      h.cfg.SoftCooldown,
 		EmbeddingsEnabled: h.cfg.EmbeddingsEnabled,
 		RecordClientInfo:  h.cfg.RecordClientInfo,
+		RecordContext:     h.cfg.RecordContext,
 		HiddenModels:      livecfg.NormalizeHiddenModels(h.cfg.ModelsHidden),
 		AllowedModels:     allowed,
 		AllowlistEnabled:  enabled,
@@ -825,6 +831,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Model  string `json:"model"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	// 会话上下文（面板「请求事件日志」展开看）：/messages 与 /responses 都先转成
+	// chat 体再进来，所以这一处就覆盖三条入站协议。开关关时为零值 nil，不落盘。
+	if h.loadLive().RecordContext {
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.context = archiveContext(body)
+		}
+	}
 
 	// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本（见
 	// upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的 tools」与

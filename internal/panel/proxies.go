@@ -25,6 +25,7 @@ func (p *Panel) proxyRoutes() {
 	p.mux.HandleFunc("POST /panel/api/proxies/{id}/check", p.withAuth(p.proxyCheck))
 	p.mux.HandleFunc("PUT /panel/api/proxies/health", p.withAuth(p.proxyHealth))
 	p.mux.HandleFunc("PUT /panel/api/accounts/{uid}/proxy", p.withAuth(p.accountProxy))
+	p.mux.HandleFunc("PUT /panel/api/proxies/realm/{realm}", p.withAuth(p.realmProxy))
 }
 
 func (p *Panel) proxyReady(w http.ResponseWriter) bool {
@@ -130,6 +131,29 @@ func (p *Panel) proxyHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.cfg.ProxyPool.Configure(body); err != nil {
+		proxyError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// realmProxy 设置 realm 级默认出口（issue #39 P3）：账号未显式绑定时取它。
+func (p *Panel) realmProxy(w http.ResponseWriter, r *http.Request) {
+	if !p.proxyReady(w) {
+		return
+	}
+	p.proxyAccountMu.Lock()
+	defer p.proxyAccountMu.Unlock()
+	realm := r.PathValue("realm")
+	if realm != "cn" && realm != "global" {
+		writeErr(w, http.StatusBadRequest, "realm must be cn or global")
+		return
+	}
+	var body proxypool.Binding
+	if !proxyBody(w, r, &body) {
+		return
+	}
+	if err := p.cfg.ProxyPool.BindRealm(realm, body); err != nil {
 		proxyError(w, err)
 		return
 	}
