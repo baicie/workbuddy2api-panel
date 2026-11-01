@@ -17,7 +17,6 @@
 package panel
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -132,10 +131,11 @@ func (p *Panel) reloginStart(w http.ResponseWriter, r *http.Request) {
 
 	// 发起设备授权（端点随目标账号的 realm 切换，与添加账号同源）。
 	// 2026-10-31 上游把 doJSON 的第 3/5 参数改成「头族 map + loginSite」，
-	// 这里跟着 loginStart 的写法对齐（x-device-token / x-no-* 一整套头）。
+	// 2026-11-01 又把第 4 个参数从 io.Reader 改成 []byte（内部做传输层重试），
+	// 这里跟着 loginStart 的写法同步（x-device-token / x-no-* 一整套头）。
 	site := siteForRealm(realm)
 	epState, _, _, _ := loginEndpointsFor(site)
-	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), bytes.NewReader([]byte("{}")), site)
+	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), []byte("{}"), site)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
