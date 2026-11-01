@@ -297,7 +297,12 @@ func TestProbeConcurrencyBound(t *testing.T) {
 		defer active.Add(-1)
 		for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
 		}
-		entered <- struct{}{}
+		// 非阻塞：两次 CheckAll × 24 个节点会产生 48 个请求，但下方只消费 8 个就离开，
+		// 缓冲满了再阻塞发送会让 handler 永远卡住、wg.Wait 挂到 go test 超时（CI 实测）。
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
 		<-release
 		w.WriteHeader(200)
 	}))
