@@ -1297,18 +1297,18 @@ $('btnModels').onclick = () => loadModels(true);
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
-// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSinceTs 是下次增量的起点。
+// 运行日志的增量拉取状态（perf）：logRows 是本地窗口，logSeq 是下次增量的起点。
 // 常态每 5 秒只传新增行，不再每轮重拉 500 行（~90KB）并重建整块 DOM。
 // LOG_ROWS_MAX 与服务端环形缓冲同量级（500）——本地窗口不必更大。
 let logRows = [];
-let logSinceTs = null;
-let logSince = '';
+let logSeq = 0;
+let logCursorAt = null;
 const LOG_ROWS_MAX = 500;
 // 增量游标最长有效期：超过则改全量拉（服务端环形缓冲只有 500 行，久了会淘汰
 // 中间旧行，增量就拿不到「完整的一段」）。
 const LOG_CURSOR_MAX_AGE_MS = 5 * 60 * 1000;
 // resetLogWindow 丢弃本地窗口，下次改为全量拉（切视图/手动重载时用）。
-function resetLogWindow() { logRows = []; logSinceTs = null; logSince = ''; }
+function resetLogWindow() { logRows = []; logSeq = 0; logCursorAt = null; }
 $('logChips').addEventListener('click', ev => {
   const b = ev.target.closest('button[data-ch]');
   if (!b) return;
@@ -1346,10 +1346,10 @@ async function loadLogs() {
     // 例外：切走很久再回来时，服务端环形缓冲（500 行）可能已经把中间的旧行
     // 淘汰掉了——增量只会拿到「还在环里」的那部分，中间缺一段。因此游标超过
     // LOG_CURSOR_MAX_AGE_MS 就退回全量拉（一次 90KB，换来不缺行）。
-    if (logSinceTs && (Date.now() - logSinceTs.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
+    if (logCursorAt && (Date.now() - logCursorAt.getTime()) > LOG_CURSOR_MAX_AGE_MS) {
       resetLogWindow();
     }
-    const lq = logSince ? '?since=' + encodeURIComponent(logSince) : '';
+    const lq = logSeq ? '?since_seq=' + logSeq : '';
     const [d, requestRows, credit, errSum] = await Promise.all([
       api('logs' + lq),
       api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
@@ -1368,19 +1368,29 @@ async function loadLogs() {
     renderRequestMetrics(metrics, recent);
     // 增量合并到本地窗口（增量拉到的行 append；全量拉到的行 replace）。
     const incoming = d.entries || [];
-    if (logSince) {
+    if (logSeq) {
       logRows = logRows.concat(incoming);
       if (logRows.length > LOG_ROWS_MAX) logRows = logRows.slice(-LOG_ROWS_MAX);
     } else {
       logRows = incoming.slice(-LOG_ROWS_MAX);
     }
-    // 下次增量的起点：本次收到的最后一条的时间戳（同毫秒的多条会被一起带上，
-    // 重复无害——服务端按 After(since) 过滤，同毫秒条目可能重复一次；用
-    // 「已见过的最大 ts」而不是「现在」是对的：不能漏）。
+    // 下次增量的起点：**服务端给的单调节号 seq**，不是时间戳。
+    //
+    // 时间戳在这里靠不住：入环 TS 是 time.Now()，同一时钟刻度内的多次写入完全相同
+    // （Windows 实测 ~15.6ms 粒度，一次 Write 的多行、背靠背的 Write 都会撞）。
+    // 按「最后一条的 ts」推进游标时，同一刻度里排在它后面（或就是它自己）的行
+    // 永远满足「晚于 since」，于是每轮轮询都重复返回一次、游标再也不前进——
+    // 面板「运行日志」底部那行反复刷出来。JS 的 Date 还只有毫秒，把原始串换成
+    // Date 往返只会让重复更严重。
+    // seq 是环内单调递增的（淘汰不回退），`seq > logSeq` 精确表达「还有哪些没给过」。
     for (const e of incoming) {
-      if (e && e.ts && (!logSinceTs || new Date(e.ts) > logSinceTs)) logSinceTs = new Date(e.ts);
+      if (e && typeof e.seq === 'number' && e.seq > logSeq) logSeq = e.seq;
     }
-    logSince = logSinceTs ? logSinceTs.toISOString() : '';
+    // logCursorAt 记的是「上次成功同步的时刻」，不是「上次出现新行的时刻」：
+    // 老化判断要回答的是「我离开多久没跟了」，与有没有新日志无关。空闲时也刷新，
+    // 否则静默期每 5 分钟就会误触发一次全量拉（90KB 白拉）。真正切走很久再回来时
+    // 轮询本来就停了，这里的值会自然变旧，届时照旧回落全量。
+    logCursorAt = new Date();
     const entries = logRows.filter(e => logCh === 'all' || e.ch === logCh);
     setHTML(box, entries.length
       ? entries.map(e => {
@@ -1694,6 +1704,8 @@ const CFG_MAP = {
   models_allowed: ['models', 'allowed'],
   models_aliases: ['models', 'aliases'],
   thinking_enabled: ['thinking', 'enabled'],
+  cn_chat_base: ['cn', 'chat_base'], cn_billing_base: ['cn', 'billing_base'],
+  global_chat_base: ['global', 'chat_base'], global_billing_base: ['global', 'billing_base'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -1706,7 +1718,7 @@ const CFG_MAP = {
  * 刻意不含 api_key：清空它 = 关闭整个鉴权，误触代价是网关变成无鉴权公开服务。
  * 该字段（以及提示文案"留空 = 不鉴权"与现状不符的问题）单独处理。
  */
-const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'cn_chat_base', 'cn_billing_base', 'global_chat_base', 'global_billing_base']);
 
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1819,6 +1831,28 @@ $('btnEye').onclick = () => {
   $('btnEye').textContent = show ? '隐藏' : '显示';
 };
 $('btnCfgReload').onclick = loadConfig;
+// cfgRealmFilter 配置页分域切换：all 显示全部；cn/global 仅显示该域专属字段
+// （data-realm 标记）。共享配置（无 data-realm）始终显示。保存时仍回传整份配置，
+// 故切换仅控制可见性、不丢字段。域名 base 等各域独立配置由此分开关，与账号池
+// 已有的 accRealmTabs 同构。
+let cfgRealmFilter = 'all';
+function applyCfgRealmFilter() {
+  document.querySelectorAll('#cfgForm [data-realm]').forEach(el => {
+    const r = el.getAttribute('data-realm');
+    el.style.display = (cfgRealmFilter === 'all' || cfgRealmFilter === r) ? '' : 'none';
+  });
+  const tabs = $('cfgRealmTabs');
+  if (tabs) tabs.querySelectorAll('button[data-realm]').forEach(b => b.classList.toggle('on', b.dataset.realm === cfgRealmFilter));
+}
+if ($('cfgRealmTabs')) {
+  $('cfgRealmTabs').addEventListener('click', ev => {
+    const btn = ev.target.closest('button[data-realm]');
+    if (!btn) return;
+    cfgRealmFilter = btn.dataset.realm;
+    applyCfgRealmFilter();
+  });
+  applyCfgRealmFilter();
+}
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
@@ -3723,6 +3757,9 @@ function renderExpirySnapshot(d) {
   }
   const dayTotals = [...dayMap.values()].sort((x, y) =>
     (x.date < y.date ? -1 : x.date > y.date ? 1 : 0) || (x.realm < y.realm ? -1 : 1));
+  if ($('expTotalNote')) {
+    $('expTotalNote').textContent = dayTotals.length ? dayTotals.length + ' 个到期日' : '暂无';
+  }
   $('expTotalBody').innerHTML = dayTotals.map(t => {
     const days = expDayDiff(t.date);
     return '<tr><td>' + esc(t.date) +
@@ -4998,7 +5035,10 @@ function renderEventTable() {
     const acctRaw = e.account || '-';
     const acctClean = acctRaw.replace(/\([^)]*\)/, '');
     const mName = e.model || '-';
-    const effort = e.reasoning_effort || '-';
+    const effort = e.reasoning_effort || '';
+    // 旧归档行没有这个键（不知道客户端发了什么）；新行恒有（空串 = 确认没发）。
+    const hasEffortReq = 'reasoning_effort_requested' in e;
+    const effortReq = e.reasoning_effort_requested || '';
 
     let resTag = '<span class="tag-badge tag-success">成功</span>';
     if (e.status === 429) {
@@ -5037,7 +5077,7 @@ function renderEventTable() {
       '<td class="time-cell"><div class="t-time">' + esc(tStr) + '</div><div class="t-date">' + esc(dStr) + '</div></td>' +
       '<td><div class="acct-cell"><span class="acct-icon"></span><span title="' + esc(acctRaw) + '">' + esc(acctClean) + '</span></div></td>' +
       '<td class="model-cell"><div class="m-name">' + esc(mName) + '</div></td>' +
-      '<td><span class="pill-effort">' + esc(effort) + '</span></td>' +
+      '<td>' + eventEffortPill(effort, effortReq, hasEffortReq) + '</td>' +
       '<td>' + resTag + '</td>' +
       '<td><span class="req-tag">' + esc(reqProto) + '</span><div class="req-path-sub">' + esc(reqPath) + '</div></td>' +
       '<td><div class="metric-main">' + esc(durSec) + '</div><div class="metric-sub">' + esc(ttfbSec) + '</div></td>' +
@@ -5051,6 +5091,21 @@ function renderEventTable() {
   }).join('');
 
   setHTML(tb, html);
+}
+
+// eventEffortPill 事件页「推理强度」列：「客户端要的」→「网关实际发出去的」两段显示。
+// 网关会在客户端没带档位时补模型默认档（thinking 默认档）、按策略改写或就近降级；
+// 只显示生效值时整列都是 max，看不出这一档是谁定的（与聊天行日志的
+// effort=max->high / effort=- ->max 同一口径）。
+//   - 一致：max；不一致（改写/降级）：high→max；客户端没发（网关补默认档）：-→max；都没有：-
+//   - hasReq=false 是升级前的老归档行（没有这个键），按旧口径只显示生效值，不臆测。
+function eventEffortPill(eff, req, hasReq) {
+  if (!hasReq) return '<span class="pill-effort">' + esc(eff || '-') + '</span>';
+  if (!eff && !req) return '<span class="pill-effort">-</span>';
+  if (!req) return '<span class="pill-effort" title="客户端未携带思考档位，这是网关补的默认档">-→' + esc(eff) + '</span>';
+  if (!eff) return '<span class="pill-effort" title="客户端要求关闭思考，或该档位模型不支持">' + esc(req) + '</span>';
+  if (req === eff) return '<span class="pill-effort">' + esc(eff) + '</span>';
+  return '<span class="pill-effort" title="左：客户端请求；右：网关实际发送">' + esc(req) + '→' + esc(eff) + '</span>';
 }
 
 // renderEventContext 把一次请求的会话上下文渲染成「角色 + 原文」块。
