@@ -482,6 +482,16 @@ def branch_for(src, idea, pol):
     return f"{pol['branch_prefix']}{slug}-{hashlib.sha1(idea.encode()).hexdigest()[:7]}"
 
 
+def proposal_part(idea):
+    """只扫报告里「适配:」之后的部分。
+
+    对比表必然把上游的多密钥/配额那一行列出来（还常写着「明确不做」），扫全表等于让
+    几乎每份报告都被禁区命中——实测 smart-open/TraeWorkAssistant 就是这么被误拦的。
+    """
+    i = idea.rfind("\n适配")
+    return idea[i:] if i >= 0 else idea
+
+
 def pick_candidates(reports, land_max, pol, exists, cool=None):
     """按值得度降序取前 land_max 条还没落地过的报告，返回 (picked, dups)。
 
@@ -495,7 +505,7 @@ def pick_candidates(reports, land_max, pol, exists, cool=None):
             continue
         src = os.path.basename(path)[:-3].replace("__", "/")
         idea = open(path, encoding="utf-8").read()
-        hit = policy_hit([], idea, pol)
+        hit = policy_hit([], proposal_part(idea), pol)
         if hit:
             banned[path] = hit
         elif (cool or {}).get(src):
@@ -605,6 +615,11 @@ def main():
                 p = os.path.join(REPORT_DIR, f)
                 reports.append((report_score(open(p, encoding="utf-8").read()), p))
         reports.sort(reverse=True)
+        if not reports and not args.dry_run:
+            # 分析阶段全挂 / 报告没传过来时这里一份输入都没有，别把「什么都没干」报成绿
+            say(lines, "没有任何输入报告，落地步骤无事可做")
+            write_report(lines)
+            return 1
         land_max = int(up.get("land_max") or 2)
         picked, dups, banned = pick_candidates(reports, land_max, pol, branch_exists,
                                               cooling_down(hist))
