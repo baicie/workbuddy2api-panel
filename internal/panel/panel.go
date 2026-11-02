@@ -275,6 +275,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.loginStart)
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.loginPoll)
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
+	// fork 独有：取消进行中的登录 + 401 账号原位重登。
+	// 2026-11-02 上游把鉴权收敛到 ServeHTTP（默认拒绝）并重写了整个路由表，
+	// `-X theirs` 合并时把这两行连着 withAuth 一起吞掉了，这里按新口径补回（不再包 withAuth）。
+	p.mux.HandleFunc("POST /panel/api/login/cancel", p.loginCancel)
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/relogin/start", p.reloginStart)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)
