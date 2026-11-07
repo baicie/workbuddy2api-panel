@@ -51,6 +51,16 @@ type Auth struct {
 	// SaveAtomic 回写时必须逐个复原成信封，否则刷新后的 token 会以明文覆盖掉
 	// 桌面端的加密文件。nil = 来源文件没加密。
 	wbSealed map[string]bool
+
+	// credEpoch 凭证代次：凭据被**整体替换**（401 失效账号原点重新登录）时 +1，
+	// 受 a.mu 保护。用途单一且关键——在途 refresh 发起时记下代次，写回前发现
+	// 代次已变即丢弃本次结果（成功与失败都丢）：那次刷新是拿**旧** RefreshToken
+	// 换来的，若照写就会把刚落盘的新授权凭证覆盖回旧凭证，重登录等于白做。
+	//
+	// 为什么光有「换 token 指针」不够：pool.upsertLocked 换 a 指针只换掉池内的
+	// 引用，handler / scheduler 手里在途请求持有的旧 *auth.Auth 指针照样会把
+	// 旧 token SaveAtomic 到同一个 FilePath。代次把这类跨指针的写回也一并挡住。
+	credEpoch uint64
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
