@@ -17,6 +17,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 	"github.com/misakano7545/workbuddy2api-panel/internal/usage"
 )
@@ -74,9 +76,9 @@ const imageAttempts = 3
 // imagesGenerations / imagesEdits 共用实现；edit 决定上游路径与入参校验。
 func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 	start := time.Now()
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	raw, berr := h.readBody(w, r)
+	if berr != nil {
+		h.writeBodyError(w, berr, false)
 		return
 	}
 	req, err := imageRequest(r, raw, edit)
@@ -174,7 +176,7 @@ func (h *Handler) images(w http.ResponseWriter, r *http.Request, edit bool) {
 		lastErr = nil
 		recordImageUsage(h, st, realm, a.UID, bare, modelRate, data, req, start)
 		if asString(req["response_format"]) == "b64_json" {
-			data = b64JSONImages(data)
+			data = b64JSONImages(r.Context(), data)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(data)
@@ -232,7 +234,11 @@ func (h *Handler) imageModel(model string) (string, string, error) {
 // imageGenerate 网关侧出一次图：选号 → 出图 → 记账，返回上游原始回执（图片链接在
 // data[].url 里）。托管 image_generation 工具的执行器走这里（见 imagetool.go），
 // 与 HTTP 入口共享模型口径、选号重试与记账口径。
-func (h *Handler) imageGenerate(req map[string]any) ([]byte, error) {
+//
+// 流水行自成一行，带该 Responses 请求的 rid/IP/UA 以便对账；不碰 tr.stat（那是对话
+// 本身的统计对象，归 chatCompletions）。客户端断连后不再起新的出图尝试；已经发出去的
+// 那次不取消——上游多半照扣，取消只会让回执丢失、账本少记。
+func (h *Handler) imageGenerate(ctx context.Context, req map[string]any) ([]byte, error) {
 	realm, bare, err := h.imageModel(asString(req["model"]))
 	if err != nil {
 		return nil, err
@@ -243,6 +249,10 @@ func (h *Handler) imageGenerate(req map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	st := newChatStat(time.Now(), bare, false, h.budget)
+	if tr, _ := ctx.Value(requestTraceKey{}).(*requestTrace); tr != nil {
+		st.requestID = tr.id
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+	}
 	defer st.done()
 	modelRate := ""
 	if h.cfg.Upstream != nil {
@@ -251,6 +261,10 @@ func (h *Handler) imageGenerate(req map[string]any) ([]byte, error) {
 	tried := map[string]bool{}
 	var lastErr error
 	for attempt := 0; attempt < imageAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			lastErr = err
+			break
+		}
 		a := h.cfg.Pool.PickExcludingForRealm(tried, bare, realm)
 		if a == nil {
 			break
@@ -260,15 +274,19 @@ func (h *Handler) imageGenerate(req map[string]any) ([]byte, error) {
 		data, ierr := h.cfg.Upstream.ImageGenerations(a, json.RawMessage(out))
 		if ierr != nil {
 			lastErr = ierr
+			if proxypool.IsError(ierr) {
+				break // 代理池不可用与账号无关，换号只会重复同样的失败（同 images）
+			}
 			var ue *upstream.Error
 			if errors.As(ierr, &ue) {
 				h.applyErrorPolicy(a.UID, ue.Kind, ue.Msg, bare, ue)
 				if requestLevelFailFastKind(ue.Kind) {
 					// 与账号无关的错误：换号必然同样失败
-					st.status = ue.Status
+					st.status, st.outcome = max(ue.Status, http.StatusBadRequest), "http_error"
 					return nil, ierr
 				}
 			}
+			log.Printf("images %s model=%s attempt=%d: %v", logfmt.Label(a.UID, a.Nickname), bare, attempt+1, ierr)
 			continue
 		}
 		recordImageUsage(h, st, realm, a.UID, bare, modelRate, data, req, st.start)
@@ -277,7 +295,11 @@ func (h *Handler) imageGenerate(req map[string]any) ([]byte, error) {
 	if lastErr == nil {
 		lastErr = fmt.Errorf("没有可用的 %s 账号", realm)
 	}
-	st.status = http.StatusBadGateway
+	if ctx.Err() != nil {
+		st.status, st.outcome = 499, reqlog.OutcomeInterrupted // 客户端走了，不算上游故障
+	} else {
+		st.status = http.StatusBadGateway
+	}
 	return nil, lastErr
 }
 
@@ -464,8 +486,9 @@ func fileToDataURL(fh *multipart.FileHeader) (string, error) {
 //
 // 上游无视这个参数、永远回签名直链（2026-11-05 实测 response_format=b64_json 仍回 url），
 // 所以只能在网关这一层转。取图失败就保留 url：图已经出了、也已经扣费，不能因为转码失败
-// 把成品丢掉。
-func b64JSONImages(data []byte) []byte {
+// 把成品丢掉。回读走 media_fetch.go 的收口（只认产物域、不跟重定向、超限报错不截断），
+// 这些都归入「取图失败」。
+func b64JSONImages(ctx context.Context, data []byte) []byte {
 	var obj map[string]any
 	if json.Unmarshal(data, &obj) != nil {
 		return data
@@ -481,7 +504,7 @@ func b64JSONImages(data []byte) []byte {
 		if u == "" {
 			continue
 		}
-		raw, err := fetchMedia(u)
+		raw, err := fetchMedia(ctx, u, mediaFetchMax)
 		if err != nil {
 			log.Printf("images: response_format=b64_json 取图失败，保留直链: %v", err)
 			continue
@@ -498,19 +521,6 @@ func b64JSONImages(data []byte) []byte {
 		return data
 	}
 	return out
-}
-
-// fetchMedia 取成品直链的字节（图像转 b64 用；视频走流式转发，见 videos.go videoContent）。
-func fetchMedia(url string) ([]byte, error) {
-	resp, err := mediaFetchHTTP.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("直链回 %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, mediaFetchMax))
 }
 
 // boundaryOf 从 Content-Type 里取 multipart boundary。
