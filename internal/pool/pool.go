@@ -38,6 +38,16 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// egress 出口级瞬时失败计数（egress.go，键 = 出口身份）。运行态，不持久化：
+	// 链路状态易失，重启后从零开始是正确的。
+	egress map[string]egressStat
+	// windows 额度窗口登记表（window.go）：429 带重置时刻时登记，到点主动发探针
+	// 让新一轮窗口从重置那一刻起算。**持久化**——进程内冷却表是易失的，窗口记录
+	// 跟着丢就等于每次重启都错过重置时刻，正是本机制要治的那段空转。
+	windows map[string]*ModelWindow
+	// scopeEnforced 号池分区是否强制（scope.go，pool.separate_text_media）。关闭时
+	// pick 不做池过滤、CheckScope 恒放行——分区前的行为逐字不变。
+	scopeEnforced bool
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -111,6 +121,14 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+
+	// strategy 选号策略（weighted / round_robin / sequential，见 strategy.go）。
+	// 空 = weighted（既有行为）。它只决定「同样合格的候选里选哪个」——健康、冷却、
+	// 在途、积分保底、成本分层、账号优先级全部先于它生效，策略无法绕过它们。
+	strategy string
+	// scheduling 策略游标：(realm, 模型) → 上次用到的账号。运行态不持久化
+	// （重启从环头重来，只影响下一次的起点，不影响正确性）。
+	scheduling map[string]scheduleCursor
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -132,6 +150,8 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		strategy:            StrategyWeighted,
+		scheduling:          map[string]scheduleCursor{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -458,6 +478,25 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.upsertLocked(a)
+}
+
+// AuthFor 返回账号凭证指针（只读用途：发起内部请求，如额度窗口探针）。
+//
+// 为什么需要它：池对外只给 Status（纯展示数据），而「用某个具体账号发一个最小请求」
+// 需要 *auth.Auth 本体。返回指针而非拷贝是刻意的——refresh 会就地改写 token，拷贝
+// 会让调用方拿着过期凭证打上游。
+//
+// 调用方**不得**修改返回值的可导出字段（除 auth 自带的加锁方法外）；uid 不存在返回 nil。
+func (p *Pool) AuthFor(uid string) *auth.Auth {
+	if uid == "" {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.a
+	}
+	return nil
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。

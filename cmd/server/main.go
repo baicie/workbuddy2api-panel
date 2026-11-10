@@ -160,6 +160,10 @@ func main() {
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring, cfg.ExpiringSoonDur)
 	p.SetAccountPriority(cfg.Pool.AccountPriority) // 账号优先级/占比（issue #62）：空表 = 不启用
 	p.SetAccountShare(cfg.Pool.AccountShare)
+	// 选号策略（pool.selection_strategy）：weighted 缺省 / round_robin / sequential。
+	p.SetStrategy(cfg.Pool.SelectionStrategy)
+	// 号池分区（pool.scope.go）：文本 / 媒体各自选号。缺省关，开了才过滤。
+	p.SetScopeEnforced(cfg.Pool.SeparateTextMedia)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -365,6 +369,12 @@ func main() {
 	case cfg.TaskSweepInterval > 0:
 		log.Printf("补领清扫：每 %s（只 accept 待接受的、只 claim 已达标未领的）", cfg.TaskSweepInterval)
 	}
+	if cfg.Pool.SeparateTextMedia {
+		log.Printf("号池分区已开启：文本对话只选 text 号、图片/视频只选 media 号（pool.separate_text_media）")
+	}
+	if !cfg.Schedule.WindowProbeEnabled {
+		log.Printf("额度窗口探针已禁用（schedule.window_probe_enabled=false）")
+	}
 	if cfg.Schedule.BalanceRefreshJitterPermill > 0 {
 		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
 			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
@@ -489,9 +499,29 @@ func main() {
 		// 积分历史账本（只读展示；写入由上面的余额观察者完成）。
 		CreditHistory: creditHist,
 	})
-	// 任务频道日志落盘（重启后任务结果可回溯）；失败只 WARN，不阻塞启动。
-	if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {
-		log.Printf("WARN: task log archive: %v", err)
+	// 面板运行日志全频道按天落盘（logging.panel_log_*）：重启后回填、支持按区间导出。
+	// 装配顺序必须在 log.SetOutput 之前——回填完再把实时输出接上，否则启动期的
+	// 那几行会先入环、再被回填的历史插到前面，时间序就乱了。
+	var panelLogs *panel.LogStore
+	if cfg.Logging.PanelLogEnabled {
+		panelLogs = panel.NewLogStore(stateSibling(cfg.StateFile, "panel-logs"),
+			cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		if panelLogs == nil {
+			log.Printf("WARN: 面板日志落盘不可用（数据目录建不出来），退回纯内存环")
+		} else {
+			if err := pn.Logs().SetLogStore(panelLogs); err != nil {
+				log.Printf("WARN: 面板日志回填失败（不影响新日志）: %v", err)
+			}
+			defer panelLogs.Close()
+			log.Printf("[panel] 运行日志落盘 %s（保留 %d 天，上限 %d MiB）",
+				panelLogs.Dir(), cfg.Logging.PanelLogRetentionDays, cfg.Logging.PanelLogMaxMB)
+		}
+	}
+	// 兜底：落盘关掉或不可用时，仍用任务频道那份 JSON 快照回填（旧行为）。
+	if panelLogs == nil {
+		if err := pn.Logs().SetTaskArchive(stateSibling(cfg.StateFile, "task-logs.json")); err != nil {
+			log.Printf("WARN: task log archive: %v", err)
+		}
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
@@ -576,6 +606,12 @@ func main() {
 	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针：上游按首次请求起算额度窗口，429 重置时刻到了没人发请求窗口就
+	// 不开始（额度空转）。到点主动发一个最小请求把起点钉住。开关见
+	// schedule.window_probe_enabled（缺省开）。
+	if cfg.Schedule.WindowProbeEnabled {
+		sch.StartModelWindowProbe(ctx)
+	}
 	if cfg.Alerting.Enabled {
 		mon := alert.New(alert.Config{
 			Enabled:          true,
@@ -916,6 +952,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetReserveCreditsByRealm(newCfg.Pool.ReserveCreditsByRealm) // 按域覆盖热生效（issue #147）
 	p.SetAccountPriority(newCfg.Pool.AccountPriority)             // 账号优先级/占比热生效（issue #62）
 	p.SetAccountShare(newCfg.Pool.AccountShare)
+	p.SetStrategy(newCfg.Pool.SelectionStrategy)      // 选号策略热生效
+	p.SetScopeEnforced(newCfg.Pool.SeparateTextMedia) // 号池分区热生效
 	sch.Reconfigure(scheduler.ScheduleParams{
 		CheckinHours:   newCfg.Schedule.CheckinHours,
 		TravelHours:    newCfg.Schedule.TravelHours,
