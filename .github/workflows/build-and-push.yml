@@ -1,6 +1,13 @@
 name: Build and Push
 
-# 打 v* 标签时：构建 linux/amd64 镜像 → 推送 GHCR → 通过 SSH 滚动更新自有服务器上的容器。
+# 打 v* 标签时：构建 linux/amd64 镜像 → 推送 GHCR（发布存档）→ 可选再推国内仓库（部署源）
+# → 通过 SSH 滚动更新自有服务器上的容器。
+#
+# 镜像分发策略：
+#   - 默认（未配 vars.TCR_IMAGE）：部署阶段从 GHCR / 加速源拉取（跨境，可能超时）。
+#   - 配了 vars.TCR_IMAGE：同一份构建产物同时推 GHCR + 国内仓库；**部署阶段只拉国内仓库**，
+#     跨境传输被限制在发布阶段，部署不再依赖 ghcr.io 的可达性。
+#     拉取后按镜像 label 的 revision 校验内容 == 本次 commit，并默认拒绝降级覆盖。
 #
 # 与既有 docker-ghcr.yml 的分工：
 #   - docker-ghcr.yml：push 到 main / 打 tag 时构建**多架构**镜像（main 推 latest/main/sha-*），
@@ -25,14 +32,21 @@ on:
         required: false
         default: ""
 
-# 同一 ref 串行，避免两个部署同时改服务器上的容器。
+# 按**目标实例**串行：cn 与 global 互不阻塞，但同一实例不会被两个发布同时改。
+# （以前按 git ref 分组，两个不同 tag 可能同时去改同一个 CN 容器。）
 concurrency:
-  group: build-and-push-${{ github.ref }}
+  group: build-and-push-${{ startsWith(github.ref_name, 'dev-v') && 'global' || 'cn' }}
   cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/baicie/workbuddy2api-panel
+  # 部署侧镜像源（可选）：配了 vars.TCR_IMAGE 就走国内仓库（腾讯云 TCR 个人版等），
+  # 部署阶段不再依赖跨境访问 ghcr.io。留空则退回原来的 GHCR + 加速源逻辑。
+  # 形如：ccr.ccs.tencentyun.com/<命名空间>/workbuddy2api-panel
+  TCR_IMAGE: ${{ vars.TCR_IMAGE }}
+  # TCR 的 registry 主机名（个人版为 ccr.ccs.tencentyun.com；换 harbor 等时改这里）
+  TCR_REGISTRY: ${{ vars.TCR_REGISTRY || 'ccr.ccs.tencentyun.com' }}
 
 jobs:
   docker:
@@ -110,6 +124,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 可选：把同一份镜像再推到国内仓库（部署侧从它拉，见 deploy job）。
+      - name: Login to TCR
+        if: env.TCR_IMAGE != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TCR_REGISTRY }}
+          username: ${{ secrets.TCR_USERNAME }}
+          password: ${{ secrets.TCR_PASSWORD }}
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v6
@@ -126,7 +149,11 @@ jobs:
           # 与需求一致：只出 amd64。要 arm64 时改成 "linux/amd64,linux/arm64"，
           # 并加一步 docker/setup-qemu-action@v3。
           platforms: linux/amd64
-          tags: ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+          # 两处 tag：GHCR 作为发布存档；TCR（若配置）作为国内部署源。
+          # 同一份构建产物推两个仓库，跨境传输发生在发布阶段，部署阶段只走国内。
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.tag }}
+            ${{ env.TCR_IMAGE != '' && format('{0}:{1}', env.TCR_IMAGE, steps.vars.outputs.tag) || '' }}
           labels: |
             org.opencontainers.image.title=workbuddy2api-panel
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -141,6 +168,9 @@ jobs:
         run: |
           # 双保险：确认刚推的 tag 真在 registry 上，防止"推送失败但 CI 绿"。
           docker buildx imagetools inspect "${IMAGE}:${{ steps.vars.outputs.tag }}"
+          if [[ -n "${TCR_IMAGE}" ]]; then
+            docker buildx imagetools inspect "${TCR_IMAGE}:${{ steps.vars.outputs.tag }}"
+          fi
 
   deploy:
     name: deploy-${{ needs.docker.outputs.target }}
@@ -168,6 +198,15 @@ jobs:
       TARGET_NAME: ${{ needs.docker.outputs.target }}
       SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
       SSH_PASSWORD: ${{ secrets.DEPLOY_SSH_PASSWORD }}
+      # 部署侧镜像源（可选）：配了 TCR_IMAGE 就**只**从国内仓库拉，不再跨境访问 GHCR。
+      # 拉取后用镜像 label 的 revision 校验内容 == 本次构建的 commit，防止串版本。
+      TCR_IMAGE: ${{ vars.TCR_IMAGE }}
+      TCR_REGISTRY: ${{ vars.TCR_REGISTRY || 'ccr.ccs.tencentyun.com' }}
+      TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
+      TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
+      EXPECTED_REVISION: ${{ github.sha }}
+      # 允许回滚到更旧 tag（默认拦截"旧版本覆盖新版本"）。回滚时置 true。
+      ALLOW_DOWNGRADE: ${{ vars.ALLOW_DOWNGRADE || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -239,9 +278,11 @@ jobs:
 
           # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
           "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
-            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" "${HOST_PORT}" <<'REMOTE'
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" "${HOST_PORT}" \
+            "${TCR_IMAGE}" "${TCR_REGISTRY}" "${TCR_USERNAME}" "${TCR_PASSWORD}" "${EXPECTED_REVISION}" "${ALLOW_DOWNGRADE}" <<'REMOTE'
           set -euo pipefail
           IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"; HOST_PORT="$8"
+          TCR="$9"; TCR_REGISTRY="${10}"; TCR_USER="${11}"; TCR_PASS="${12}"; WANT_REV="${13}"; ALLOW_DOWN="${14}"
           DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
           CANONICAL="${IMAGE}:${TAG}"
           REPO_PATH="${IMAGE#ghcr.io/}"
@@ -268,22 +309,34 @@ jobs:
           # 国内云主机直连 ghcr.io 实测约 21.5KB/s（35MB 镜像需近半小时），故镜像源优先。
           # **按 digest 拉取**：内容寻址，加速源无法替换镜像内容（哈希必须一致），
           # 这也让"用第三方加速"不再是一个纯信任问题。
+          #
+          # 配了 TCR_IMAGE 时：**只从国内仓库拉**，不再跨境访问 GHCR —— 这是解决
+          # 「所有镜像源都拉取失败」的正解（把跨境传输挪到发布阶段）。
           candidates=()
-          _add_mirrors() {
-            local suffix="$1"
-            [[ -z "${MIRRORS}" ]] && return 0
-            local IFS=','
-            for m in ${MIRRORS}; do
-              m="$(printf '%s' "$m" | tr -d '[:space:]')"
-              [[ -n "$m" ]] && candidates+=("${m}/${REPO_PATH}${suffix}")
-            done
-          }
-          if [[ -n "${DIGEST}" ]]; then
-            _add_mirrors "@${DIGEST}"
-            candidates+=("${IMAGE}@${DIGEST}")
+          if [[ -n "${TCR}" ]]; then
+            if [[ -n "${TCR_USER}" ]]; then
+              # 私有仓库：在服务器上登录（凭据经 SSH stdin 传入，不落磁盘、不进日志）。
+              printf '%s' "${TCR_PASS}" | "${DOCKER[@]}" login "${TCR_REGISTRY}" -u "${TCR_USER}" --password-stdin >/dev/null
+              echo "==> 已登录 ${TCR_REGISTRY}"
+            fi
+            candidates+=("${TCR}:${TAG}")
           else
-            _add_mirrors ":${TAG}"
-            candidates+=("${CANONICAL}")
+            _add_mirrors() {
+              local suffix="$1"
+              [[ -z "${MIRRORS}" ]] && return 0
+              local IFS=','
+              for m in ${MIRRORS}; do
+                m="$(printf '%s' "$m" | tr -d '[:space:]')"
+                [[ -n "$m" ]] && candidates+=("${m}/${REPO_PATH}${suffix}")
+              done
+            }
+            if [[ -n "${DIGEST}" ]]; then
+              _add_mirrors "@${DIGEST}"
+              candidates+=("${IMAGE}@${DIGEST}")
+            else
+              _add_mirrors ":${TAG}"
+              candidates+=("${CANONICAL}")
+            fi
           fi
 
           PULLED=""
@@ -298,6 +351,33 @@ jobs:
           fi
           "${RUN[@]}" tag "${PULLED}" "${CANONICAL}"
           echo "==> 镜像就绪：${CANONICAL}（来源 ${PULLED}）"
+
+          # 内容校验：跨 registry 后 manifest digest 不保证相同，用构建期写入的
+          # revision label 比对最可靠——保证拉到的确实是本次这个 commit 的产物。
+          got_rev="$("${RUN[@]}" inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "${CANONICAL}" 2>/dev/null || echo '')"
+          if [[ -n "${WANT_REV}" && "${got_rev}" != "${WANT_REV}" ]]; then
+            echo "::error::镜像内容校验失败：revision=${got_rev:-<空>}，期望 ${WANT_REV}（拉到的不是本次构建产物）"
+            exit 1
+          fi
+          echo "==> 内容校验通过：revision=${got_rev}"
+
+          # 降级保护：默认不允许用更旧的 tag 覆盖线上更新的版本（并发/补发时容易发生）。
+          # 版本标签形如 vYYYY.M.D.HMM，按定长数字比较；非该格式（如 dev-<sha>）跳过。
+          _vkey() {
+            local v="${1#v}"
+            case "$v" in
+              [0-9]*.[0-9]*.[0-9]*.[0-9]*) printf '%s' "$v" | awk -F. '{printf "%04d%03d%03d%04d", $1, $2, $3, $4}' ;;
+              *) printf '' ;;
+            esac
+          }
+          cur_img="$("${RUN[@]}" inspect -f '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null || echo '')"
+          cur_tag="${cur_img##*:}"
+          new_key="$(_vkey "${TAG}")"; cur_key="$(_vkey "${cur_tag}")"
+          if [[ -n "${new_key}" && -n "${cur_key}" && "${new_key}" < "${cur_key}" && "${ALLOW_DOWN}" != "true" ]]; then
+            echo "::error::拒绝降级：线上运行 ${cur_tag}，本次要部署的 ${TAG} 更旧。"
+            echo "  确需回滚请把仓库变量 ALLOW_DOWNGRADE 设为 true 后重跑本 job。"
+            exit 1
+          fi
 
           cd "${DIR}"
           # config.json 必须先存在：缺失时 Docker 会把 bind mount 建成目录，容器随即
