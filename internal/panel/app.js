@@ -1792,6 +1792,30 @@ function fmtBytes(bytes) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
+/* 运行日志导出：落盘文件按区间打包成 ZIP。
+ * 用 location.href 直接触发下载而不是 fetch+blob——落盘包可能几十 MB，
+ * blob 会把整包读进内存再复制一份；href 让浏览器原生流式落盘。
+ * 失败（落盘未启用 / 区间无数据）时后端回 JSON 错误，浏览器会把它当文件下载，
+ * 所以先 HEAD 一次拿状态码，非 2xx 就读回错误文案弹出来。 */
+$('btnLogExport').onclick = async () => {
+  const days = $('logExportDays').value || '3';
+  const url = '/panel/api/logs/export?days=' + encodeURIComponent(days);
+  try {
+    const resp = await fetch(url, {method: 'HEAD'});
+    if (!resp.ok) {
+      // HEAD 不带 body，再 GET 一次拿文案（数据量很小：只有一个错误 JSON）。
+      const detail = await fetch(url).then(r => r.text()).catch(() => '');
+      let msg = 'HTTP ' + resp.status;
+      try { msg = JSON.parse(detail).error || msg; } catch (e) { }
+      alert('导出失败：' + msg);
+      return;
+    }
+    location.href = url;
+  } catch (e) {
+    alert('导出失败：' + e);
+  }
+};
+
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
@@ -2066,6 +2090,9 @@ $('cfgForm').onsubmit = async ev => {
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+// 导入预览态的暂存：{files: File[], ready: bool, result?: 预览响应}。
+// 只活到确认导入或关闭弹窗为止；File 对象本身在浏览器里，再次 POST 时重发即可。
+let importPending = null;
 function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到登录标签
@@ -2086,9 +2113,11 @@ function switchAddTab(tab) {
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
   $('addTabApiKey').hidden = tab !== 'apikey';
-  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」，导入页无页脚按钮。
+  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、
+  // 导入页「确认导入」（仅预览通过后出现，见 renderImportPreview）。
   $('btnAddApiKey').hidden = tab !== 'apikey';
   $('btnStartLogin').hidden = tab !== 'login' || loginState != null;
+  $('btnImportCommit').hidden = !(tab === 'import' && importPending && importPending.ready);
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -2184,7 +2213,17 @@ async function pollLogin() {
     $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + e.message;
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() {
+  stopPoll(); loginState = null; $('addVeil').classList.remove('on');
+  // 导入预览态一并清掉：关掉弹窗再打开时不该还挂着上一次的文件和「确认导入」。
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('importPreview').innerHTML = '';
+  $('btnImportCommit').hidden = true;
+  $('importDone').hidden = true;
+  $('importErr').hidden = true;
+  $('importFile').value = '';
+}
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 
@@ -2216,31 +2255,97 @@ $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
-  const file = $('importFile').files[0];
-  if (!file) return;
+  const files = Array.from($('importFile').files || []);
   $('importDone').hidden = true; $('importErr').hidden = true;
-  const fd = new FormData();
-  fd.append('file', file);
-  const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('btnImportCommit').hidden = true;
+  if (!files.length) return;
+  // 导入是不可逆动作（覆盖已有凭据前还要过上游校验），所以分两步：选中文件后先
+  // 发一次 dryRun 预览——服务端只做解析、必填、uid 合法性与批内去重，不落盘、
+  // 不发上游请求；点「确认导入」才真正写入。
+  //
+  // 多文件在服务端是整体事务：任一文件不是合法 JSON 或没有任何账号就整体 400，
+  // 不做「先把前面那部分导进去」。顺序即选择顺序（先选的优先）。
+  importPending = { files, ready: false };
+  const label = files.length > 1 ? files.length + ' 个文件' : files[0].name;
+  $('importPreview').hidden = false;
+  $('importPreview').innerHTML = '<div class="hint">正在校验 ' + esc(label) + '…</div>';
   try {
-    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const d = await postImport(true);
+    importPending.result = d;
+    importPending.ready = true;
+    renderImportPreview(label, d);
+    $('btnImportCommit').hidden = false;
+  } catch (e) {
+    importPending = null;
+    $('importPreview').innerHTML = '<div class="hint" style="color:var(--warn)">校验失败，未导入任何账号：' + esc(e.message) + '</div>';
+    $('btnImportCommit').hidden = true;
+  }
+};
+$('btnImportCommit').onclick = async () => {
+  if (!importPending || !importPending.ready) return;
+  const btn = $('btnImportCommit');
+  btn.disabled = true;
+  const label = importPending.files.length > 1 ? importPending.files.length + ' 个文件' : importPending.files[0].name;
+  try {
+    const d = await postImport(false);
+    $('importPreview').hidden = true;
     $('importDone').hidden = false;
-    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
-    if (d.errors && d.errors.length) {
-      console.warn('import errors:', d.errors);
-    }
+    $('importDone').textContent = '导入完成（' + label + '）：新增 ' + (d.creates || 0)
+      + ' 个，覆盖 ' + (d.overwrites || 0) + ' 个'
+      + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+    if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+    importPending = null;
+    $('btnImportCommit').hidden = true;
     invalidatePackages();
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
+    btn.disabled = false;
   }
   $('importFile').value = '';
 };
+
+// 预览区：先给一句人话结论（新增/覆盖/跳过），再列具体条目问题。
+// 跳过项只列前 20 条——几百条的清单塞进弹窗只会把「结论」顶出视野。
+function renderImportPreview(label, d) {
+  const bits = ['新增 ' + (d.creates || 0) + ' 个', '覆盖 ' + (d.overwrites || 0) + ' 个'];
+  if (d.skipped) bits.push('跳过 ' + d.skipped + ' 个');
+  let html = '<div class="hint"><b>' + esc(label) + '</b> · 共 ' + (d.total || 0) + ' 条：' + bits.join('，') + '</div>';
+  if (d.overwrites) {
+    html += '<div class="hint" style="font-size:12px">覆盖项会先用 refresh 向上游求证新凭据可用，通过才写盘；不通过则保留原有凭据。</div>';
+  }
+  const errs = d.errors || [];
+  if (errs.length) {
+    const shown = errs.slice(0, 20);
+    html += '<div class="hint" style="font-size:12px;margin-top:4px;color:var(--ink-3)">跳过明细'
+      + (errs.length > shown.length ? '（前 ' + shown.length + ' 条，共 ' + errs.length + ' 条）' : '')
+      + '：</div><div style="max-height:120px;overflow:auto;font-size:12px;color:var(--ink-2)">'
+      + shown.map(e => '<div>' + esc(e) + '</div>').join('') + '</div>';
+  }
+  if (!d.imported) {
+    html += '<div class="hint" style="color:var(--warn)">没有可导入的账号。</div>';
+  }
+  $('importPreview').innerHTML = html;
+}
+
+// 导入请求：多文件按选择顺序塞进同一个 multipart，服务端逐份解码后合并。
+function postImport(dryRun) {
+  const fd = new FormData();
+  for (const f of importPending.files) fd.append('file', f, f.name);
+  if (dryRun) fd.append('dryRun', 'true');
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h })
+    .then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      return d;
+    });
+}
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
@@ -4321,10 +4426,10 @@ function remarkFormRows() {
   // key = uid 前 8 位（备注映射的键）；uid 保留全值，分组要打真接口按完整 uid 走；
   // inPool=false 的行是「账号已不在池里、但本机还留着备注」的孤儿，只能改备注。
   const rows = ((overviewData && overviewData.accounts) || [])
-    .map(s => ({ key: remarkKey(s.uid), uid: s.uid, who: s.nickname || remarkKey(s.uid), group: s.group || '', inPool: true }))
+    .map(s => ({ key: remarkKey(s.uid), uid: s.uid, who: s.nickname || remarkKey(s.uid), group: s.group || '', scope: s.pool_scope || 'text', inPool: true }))
     .filter(r => r.key);
   for (const k of Object.keys(remarksAll())) {
-    if (!rows.some(r => r.key === k)) rows.push({ key: k, uid: '', who: k, group: '', inPool: false });
+    if (!rows.some(r => r.key === k)) rows.push({ key: k, uid: '', who: k, group: '', scope: 'text', inPool: false });
   }
   return rows;
 }
@@ -4332,6 +4437,9 @@ function remarkFormRows() {
 /* 分组编辑的原始值（保存时只提交真正改动过的行，避免「保存备注」顺手把几十个账号
    的分组各打一次接口）。 */
 let remarkGroupOrig = {};
+/* 号池标注的原始值。与 group 分开记：两者是不同接口、不同语义（scope 参与选号，
+   group 纯管理），改动互不影响，混在一个 map 里会让「只改了号池」也去提交分组。 */
+let remarkScopeOrig = {};
 /* onlyUID 非空时只渲染该账号一行（账号池行内「备注」按钮走这条），避免为改一个号
    在几十行里翻找。 */
 function renderRemarkBody(onlyUID) {
@@ -4343,12 +4451,16 @@ function renderRemarkBody(onlyUID) {
     rows = rows.filter(r => r.key === k);
   }
   remarkGroupOrig = {};
-  rows.forEach(r => { if (r.inPool) remarkGroupOrig[r.uid] = r.group; });
+  remarkScopeOrig = {};
+  rows.forEach(r => { if (r.inPool) { remarkGroupOrig[r.uid] = r.group; remarkScopeOrig[r.uid] = r.scope; } });
   box.innerHTML = rows.length
     ? rows.map(r => '<div class="rm-row"><span class="rm-who" title="' + esc(r.who) + '">' + esc(r.who) + '</span>' +
         '<input type="text" data-uid="' + esc(r.key) + '" value="' + esc(remarksAll()[r.key] || '') + '" placeholder="备注（留空即清除）" maxlength="24">' +
         (r.inPool
-          ? '<input type="text" data-guid="' + esc(r.uid) + '" value="' + esc(r.group) + '" placeholder="分组（留空即未分组）" maxlength="24">'
+          ? '<input type="text" data-guid="' + esc(r.uid) + '" value="' + esc(r.group) + '" placeholder="分组（留空即未分组）" maxlength="24">' +
+            '<select data-suid="' + esc(r.uid) + '" title="号池分区：开启 pool.separate_text_media 后文本对话只选 text 号、图片/视频只选 media 号">' +
+            ['text', 'media'].map(v => '<option value="' + v + '"' + (r.scope === v ? ' selected' : '') + '>' +
+              (v === 'media' ? '媒体号池' : '文本号池') + '</option>').join('') + '</select>'
           : '<input type="text" value="（账号已不在池里）" disabled>') +
         '</div>').join('')
     : '<div class="empty">暂无账号：先在「账号池」加载一次账号列表。</div>';
@@ -4373,6 +4485,12 @@ async function saveRemarkForm() {
     const uid = inp.getAttribute('data-guid'), v = inp.value.trim();
     if ((remarkGroupOrig[uid] || '') !== v) changed.push([uid, v]);
   });
+  // 号池标注（服务端字段，参与选号）：同样只提交改动过的行。
+  const scopeChanged = [];
+  document.querySelectorAll('#remarkBody select[data-suid]').forEach(sel => {
+    const uid = sel.getAttribute('data-suid'), v = sel.value;
+    if ((remarkScopeOrig[uid] || 'text') !== v) scopeChanged.push([uid, v]);
+  });
   closeRemarks();
   let ok = 0;
   const bad = [];
@@ -4380,12 +4498,20 @@ async function saveRemarkForm() {
     try { await api('accounts/' + encodeURIComponent(uid) + '/group', { method: 'POST', body: JSON.stringify({ group }) }); ok++; }
     catch (e) { bad.push(uid.slice(0, 8) + '：' + e.message); }
   }
+  let scopeOk = 0;
+  for (const [uid, scope] of scopeChanged) {
+    try { await api('accounts/' + encodeURIComponent(uid) + '/scope', { method: 'POST', body: JSON.stringify({ scope }) }); scopeOk++; }
+    catch (e) { bad.push(uid.slice(0, 8) + '：' + e.message); }
+  }
   if (view === 'accounts') loadOverview(true);
   else if (view === 'usage' && usageData) renderUsage(usageData);
-  if (changed.length) {
+  if (changed.length || scopeChanged.length) {
+    const parts = [];
+    if (changed.length) parts.push('分组已更新 ' + ok + ' 个');
+    if (scopeChanged.length) parts.push('号池已更新 ' + scopeOk + ' 个');
     const head = bad.length
-      ? '分组已更新 ' + ok + ' 个，失败 ' + bad.length + ' 个（' + bad[0] + '）'
-      : '分组已更新 ' + ok + ' 个';
+      ? parts.join('、') + '，失败 ' + bad.length + ' 个（' + bad[0] + '）'
+      : parts.join('、');
     toast(head + (saved ? '' : '；备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失'), bad.length || !saved ? 'err' : 'ok');
   } else {
     toast(saved ? '备注已保存（仅本机浏览器）' : '备注未能写入浏览器存储（隐私模式或空间已满），刷新后会丢失', saved ? '' : 'err');
@@ -5556,10 +5682,16 @@ $('proxyImport').onclick = async () => {
   try {
     const data = await api('proxies', { method: 'POST', body: JSON.stringify({ lines }) });
     const rows = data.results || [];
-    $('proxyImportResults').textContent = '添加 ' + rows.filter(r => r.status === 'added').length + ' 个 · 重复 ' + rows.filter(r => r.status === 'duplicate').length + ' 个 · 无效 ' + rows.filter(r => r.status === 'invalid').length + ' 个' +
+    // unsupported 单列：那些是「认得出来、但本网关传输层不解析」的协议（ss/vmess/
+    // trojan…）。既不该算作无效（用户没写错），也不该回填输入框（整段订阅回填没
+    // 意义），只把原因说清楚。
+    const skipped = rows.filter(r => r.status === 'unsupported');
+    $('proxyImportResults').textContent = '添加 ' + rows.filter(r => r.status === 'added').length + ' 个 · 重复 ' + rows.filter(r => r.status === 'duplicate').length +
+      ' 个 · 不支持 ' + skipped.length + ' 个 · 无效 ' + rows.filter(r => r.status === 'invalid').length + ' 个' +
+      skipped.map(r => '\n' + (r.name || ('第 ' + r.line + ' 行')) + '：' + r.error).join('') +
       rows.filter(r => r.status === 'invalid').map(r => '\n第 ' + r.line + ' 行：' + r.error).join('');
     const inputLines = lines.split('\n');
-    $('proxyLines').value = rows.filter(r => r.status === 'invalid').map(r => inputLines[r.line - 1]).join('\n');
+    $('proxyLines').value = rows.filter(r => r.status === 'invalid').map(r => inputLines[r.line - 1] || '').join('\n');
     await loadProxies();
   } catch (e) { toast('添加失败：' + e.message, 'err'); }
   finally { button.disabled = false; }

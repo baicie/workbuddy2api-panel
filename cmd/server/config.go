@@ -69,6 +69,16 @@ type Config struct {
 		// 拒这条请求」时它是唯一能对上的证据，但那该是运维主动开的临时手段，
 		// 不是默认行为。热生效，无需重启。
 		RequestArchiveContext bool `json:"request_archive_context"`
+		// PanelLogEnabled 面板「运行日志」是否按天落盘，缺省 true。
+		//
+		// 为什么默认开：内存环每频道只有 500 条，一次长会话就能把上午的行冲掉，
+		// 重启更是全部归零——「昨天下午那波 429 从几点开始的」这类问题原本无解。
+		// 落盘是纯增量文本（一天几 MB），代价远小于丢失事故现场。
+		PanelLogEnabled bool `json:"panel_log_enabled"`
+		// PanelLogRetentionDays 面板日志保留天数，缺省 7；<=0 回落默认。
+		PanelLogRetentionDays int `json:"panel_log_retention_days"`
+		// PanelLogMaxMB 面板日志总量上限（MiB，按天文件，单文件超限轮转），缺省 50。
+		PanelLogMaxMB int `json:"panel_log_max_mb"`
 	} `json:"logging"`
 
 	Server struct {
@@ -185,6 +195,15 @@ type Config struct {
 		// 「无卡/无断点/数据异常一律跳过，绝不瞎补」）。这里默认不动既有行为，
 		// 想保守的部署把它设成 1 即可——两轮之间还有次日签到，急不来。
 		MakeupCardsPerRound int `json:"makeup_cards_per_round"` // 缺省 0（不限）；>0 = 每轮上限
+
+		// 额度窗口探针（pool/window.go + scheduler/windowprobe.go）：上游 429 带
+		// 「将在 … 重置」时登记窗口，到点主动发一个最小请求，把新一轮额度窗口的
+		// 计时起点钉在重置那一刻。
+		//
+		// 为什么需要：上游按**首次请求**起算窗口。重置时刻到了却没人发请求，窗口就
+		// 不开始，额度一直空转；等下一条真实请求进来，起点落到那一刻，中间那段额度
+		// 白扔。关闭后行为回到「只解除冷却、不主动起窗」。
+		WindowProbeEnabled bool `json:"window_probe_enabled"` // 缺省 true；false = 关闭
 	} `json:"schedule"`
 
 	Global struct {
@@ -369,11 +388,30 @@ type Config struct {
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
 		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
-		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
-		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
-		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		// SelectionStrategy 选号策略（pool 包 strategy.go）：weighted（缺省，加权随机）/
+		// round_robin（轮询，每次请求换下一个）/ sequential（顺序耗尽，当前号用到不可用
+		// 才换）。空或未知值 = weighted。
+		//
+		// 三条策略都只在**已过全部可用性判定**的候选里决定「选哪个」：健康、冷却、
+		// 在途上限、积分保底、成本分层、账号优先级全部先于它生效。所以切到
+		// sequential 也烧不穿 credit_floor——这是有意的边界，不是实现疏忽。
+		// 热生效（面板保存配置即换），无需重启。
+		SelectionStrategy string `json:"selection_strategy"`
+		// SeparateTextMedia 号池分区（pool 包 scope.go）：文本对话与图片/视频生成
+		// 各自从自己的号池里选号。缺省 false = 分区前的行为逐字不变。
+		//
+		// 为什么值得开：两类请求在上游是两套风控口径，同一个号既对话又画图时，画图
+		// 侧被判异常会连坐文本侧。分区后互不污染。代价是两边的可用号都变少——号不多
+		// 的部署开了可能反而更容易 503，所以缺省关。
+		//
+		// 打开后**必须**给要画图的号单独标 media（面板账号行「号池」下拉）：未标注的
+		// 号一律按文本号处理（保守缺省，避免老部署升级当天画图全 403）。
+		SeparateTextMedia bool    `json:"separate_text_media"`
+		IdleWeightPerHour float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax     float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -526,6 +564,9 @@ func Default() *Config {
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
 	c.Logging.RequestArchiveMaxMB = 100
+	c.Logging.PanelLogEnabled = true
+	c.Logging.PanelLogRetentionDays = 7
+	c.Logging.PanelLogMaxMB = 50
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
@@ -547,6 +588,10 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
+	c.Schedule.WindowProbeEnabled = true
+	// 号池分区缺省关闭：显式写出来是为了让「默认值」在 Default() 里可读，
+	// 而不是靠调用者去猜 bool 零值。
+	c.Pool.SeparateTextMedia = false
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -938,6 +983,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+		c.Logging.PanelLogEnabled = true
+		c.Logging.PanelLogRetentionDays = 7
+		c.Logging.PanelLogMaxMB = 50
 	}
 	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
 	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
