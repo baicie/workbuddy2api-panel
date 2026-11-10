@@ -291,12 +291,23 @@ jobs:
           SSH+=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p "${DEPLOY_PORT}")
 
           # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
+          # 注意：ssh 会把参数拼成一条字符串再在远端重新分词，**空参数会被丢掉**，
+          # 于是后面的位置参数整体前移（实测表现为 "$12: unbound variable"）。
+          # 所以空值统一替换成占位符，远端再还原。
+          EMPTY_PH='__EMPTY__'
+          arg() { if [[ -n "${1:-}" ]]; then printf '%s' "$1"; else printf '%s' "${EMPTY_PH}"; fi; }
           "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
-            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS// /,}" "${HOST_PORT}" \
-            "${TCR_IMAGE}" "${TCR_REGISTRY}" "${TCR_USERNAME}" "${TCR_PASSWORD}" "${EXPECTED_REVISION}" "${ALLOW_DOWNGRADE}" <<'REMOTE'
+            "$(arg "${IMAGE_REF}")" "$(arg "${DEPLOY_TAG}")" "$(arg "${IMAGE_DIGEST}")" "$(arg "${CONTAINER}")" \
+            "$(arg "${DEPLOY_DIR}")" "$(arg "${HEALTH_URL}")" "$(arg "${GHCR_MIRRORS// /,}")" "$(arg "${HOST_PORT}")" \
+            "$(arg "${TCR_IMAGE}")" "$(arg "${TCR_REGISTRY}")" "$(arg "${TCR_USERNAME}")" "$(arg "${TCR_PASSWORD}")" \
+            "$(arg "${EXPECTED_REVISION}")" "$(arg "${ALLOW_DOWNGRADE}")" <<'REMOTE'
           set -euo pipefail
-          IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"; HOST_PORT="$8"
-          TCR="$9"; TCR_REGISTRY="${10}"; TCR_USER="${11}"; TCR_PASS="${12}"; WANT_REV="${13}"; ALLOW_DOWN="${14}"
+          # 还原占位符：空参数在 ssh 传参时会被丢弃，所以这里必须先翻译再使用。
+          unempty() { if [ "${1:-}" = "__EMPTY__" ]; then printf ''; else printf '%s' "${1:-}"; fi; }
+          IMAGE="$(unempty "$1")"; TAG="$(unempty "$2")"; DIGEST="$(unempty "$3")"; CONTAINER="$(unempty "$4")"
+          RAW_DIR="$(unempty "$5")"; HEALTH="$(unempty "$6")"; MIRRORS="$(unempty "$7")"; HOST_PORT="$(unempty "$8")"
+          TCR="$(unempty "$9")"; TCR_REGISTRY="$(unempty "${10}")"; TCR_USER="$(unempty "${11}")"
+          TCR_PASS="$(unempty "${12}")"; WANT_REV="$(unempty "${13}")"; ALLOW_DOWN="$(unempty "${14}")"
           DIR="${RAW_DIR/#\$HOME/$HOME}"; DIR="${DIR/#\~/$HOME}"
           CANONICAL="${IMAGE}:${TAG}"
           REPO_PATH="${IMAGE#ghcr.io/}"
