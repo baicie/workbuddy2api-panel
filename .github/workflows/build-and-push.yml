@@ -292,7 +292,7 @@ jobs:
 
           # 远端脚本从 stdin 读、参数用位置参数传（不拼进命令串，避免注入）。
           "${SSH[@]}" "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' -- \
-            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS}" "${HOST_PORT}" \
+            "${IMAGE_REF}" "${DEPLOY_TAG}" "${IMAGE_DIGEST}" "${CONTAINER}" "${DEPLOY_DIR}" "${HEALTH_URL}" "${GHCR_MIRRORS// /,}" "${HOST_PORT}" \
             "${TCR_IMAGE}" "${TCR_REGISTRY}" "${TCR_USERNAME}" "${TCR_PASSWORD}" "${EXPECTED_REVISION}" "${ALLOW_DOWNGRADE}" <<'REMOTE'
           set -euo pipefail
           IMAGE="$1"; TAG="$2"; DIGEST="$3"; CONTAINER="$4"; RAW_DIR="$5"; HEALTH="$6"; MIRRORS="$7"; HOST_PORT="$8"
