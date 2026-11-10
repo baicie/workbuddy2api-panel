@@ -64,6 +64,7 @@ jobs:
       deploy_port: ${{ steps.vars.outputs.deploy_port }}
       deploy_name: ${{ steps.vars.outputs.deploy_name }}
       health_url: ${{ steps.vars.outputs.health_url }}
+      revision: ${{ steps.vars.outputs.revision }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -102,8 +103,20 @@ jobs:
             deploy_port="7863"
             deploy_name="workbuddy2api"
           fi
+          # 镜像内容校验用的 revision：镜像 label 记的是**构建时的 commit**。
+          # tag 触发时就是 GITHUB_SHA；手动补部署旧 tag 时必须取该 tag 指向的 commit，
+          # 否则用当前 HEAD 去比对必然不匹配（补部署会被自己的校验拦住）。
+          revision="${GITHUB_SHA}"
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            # 手动补部署时 checkout 的是分支，本地没有该 tag，先按需拉一次。
+            git fetch -q --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || true
+            if git rev-parse -q --verify "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
+              revision="$(git rev-parse "refs/tags/${tag}^{commit}")"
+            fi
+          fi
           {
             echo "tag=${tag}"
+            echo "revision=${revision}"
             echo "image=${IMAGE}"
             echo "release=${release}"
             echo "target=${target}"
@@ -204,7 +217,8 @@ jobs:
       TCR_REGISTRY: ${{ vars.TCR_REGISTRY || 'ccr.ccs.tencentyun.com' }}
       TCR_USERNAME: ${{ secrets.TCR_USERNAME }}
       TCR_PASSWORD: ${{ secrets.TCR_PASSWORD }}
-      EXPECTED_REVISION: ${{ github.sha }}
+      # 镜像 label 里的 revision = 该 tag 的构建 commit（补部署旧 tag 时不能用当前 HEAD）
+      EXPECTED_REVISION: ${{ needs.docker.outputs.revision || github.sha }}
       # 允许回滚到更旧 tag（默认拦截"旧版本覆盖新版本"）。回滚时置 true。
       ALLOW_DOWNGRADE: ${{ vars.ALLOW_DOWNGRADE || 'false' }}
     steps:
@@ -324,9 +338,8 @@ jobs:
             _add_mirrors() {
               local suffix="$1"
               [[ -z "${MIRRORS}" ]] && return 0
-              local IFS=','
-              for m in ${MIRRORS}; do
-                m="$(printf '%s' "$m" | tr -d '[:space:]')"
+              # 逗号或空白分隔都接受（GHCR_MIRRORS 写 "a.com b.com" 或 "a.com,b.com" 均可）
+              for m in $(printf '%s' "${MIRRORS}" | tr ',;' '  '); do
                 [[ -n "$m" ]] && candidates+=("${m}/${REPO_PATH}${suffix}")
               done
             }
