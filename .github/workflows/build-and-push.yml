@@ -432,11 +432,23 @@ jobs:
 
           # 可选健康检查：/healthz 在「池里没有可用账号」时按设计返回 503，故默认不查它；
           # 需要时把 DEPLOY_HEALTH_URL 设为 http://127.0.0.1:7863/panel/ 之类的地址。
+          #
+          # 必须重试：compose 刚 up 完时进程还没监听端口，一次 curl 只会拿到 000，
+          # 发布就会在服务其实正常的情况下判失败。这里等到 200 或超时（60 秒）。
           if [[ -n "${HEALTH}" ]]; then
-            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${HEALTH}" || echo 000)"
-            echo "==> 健康检查 ${HEALTH} -> HTTP ${code}"
+            code=""
+            for attempt in $(seq 1 30); do
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "${HEALTH}" || echo 000)"
+              if [[ "${code}" == "200" ]]; then
+                echo "==> 健康检查 ${HEALTH} -> HTTP 200（第 ${attempt} 次，约 $((attempt * 2)) 秒）"
+                break
+              fi
+              echo "    健康检查第 ${attempt} 次：HTTP ${code}，2 秒后重试"
+              sleep 2
+            done
             if [[ "${code}" != "200" ]]; then
-              echo "::error::健康检查未通过（HTTP ${code}）"
+              echo "::error::健康检查未通过（HTTP ${code}，已重试 30 次）"
+              "${RUN[@]}" logs --tail 50 "${CONTAINER}" 2>&1 || true
               exit 1
             fi
           fi
