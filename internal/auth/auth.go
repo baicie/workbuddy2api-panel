@@ -47,20 +47,15 @@ type Auth struct {
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
 
-	// wbSealed 源文件里原本是 $wbEncrypted 信封的字段（"auth.accessToken" 形态）：
-	// SaveAtomic 回写时必须逐个复原成信封，否则刷新后的 token 会以明文覆盖掉
-	// 桌面端的加密文件。nil = 来源文件没加密。
-	wbSealed map[string]bool
-
-	// credEpoch 凭证代次：凭据被**整体替换**（401 失效账号原点重新登录）时 +1，
-	// 受 a.mu 保护。用途单一且关键——在途 refresh 发起时记下代次，写回前发现
-	// 代次已变即丢弃本次结果（成功与失败都丢）：那次刷新是拿**旧** RefreshToken
-	// 换来的，若照写就会把刚落盘的新授权凭证覆盖回旧凭证，重登录等于白做。
-	//
-	// 为什么光有「换 token 指针」不够：pool.upsertLocked 换 a 指针只换掉池内的
-	// 引用，handler / scheduler 手里在途请求持有的旧 *auth.Auth 指针照样会把
-	// 旧 token SaveAtomic 到同一个 FilePath。代次把这类跨指针的写回也一并挡住。
-	credEpoch uint64
+	// 来源文件是新版桌面端的 $wbEncrypted 加密形态（见 wbencrypted.go）时才非零：
+	//   - wbSealed：原本是信封的字段路径（"auth.accessToken" / 扁平形 "accessToken"）；
+	//   - wbDoc：解密后的整份文档。SaveAtomic 以它为底回写，桌面端自己的字段（phoneNumber、
+	//     uin 等）与原有形态（嵌套/扁平）都保留，再按 wbSealed 复原信封；
+	//   - expiresAtMillis：来源的 expiresAt 是毫秒（桌面端口径）。内存里统一用秒，回写换回毫秒。
+	// 只在 Parse 里写，之后只读。
+	wbSealed        map[string]bool
+	wbDoc           map[string]any
+	expiresAtMillis bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -429,7 +424,7 @@ func Parse(raw []byte) (*Auth, error) {
 	}
 	// 新版桌面端把 auth 字段换成 $wbEncrypted 信封（见 wbencrypted.go）。
 	// 解密后再按原两形态解析；未加密文件原样返回，不吃这条路径。
-	dec, sealed, err := decryptWBEncrypted(raw)
+	dec, sealed, wbDoc, err := decryptWBEncrypted(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -504,8 +499,11 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	rawExpires := a.ExpiresAt
 	a.ExpiresAt = normalizeExpiresAt(a.ExpiresAt)
-	a.wbSealed = sealed
+	if len(sealed) > 0 {
+		a.wbSealed, a.wbDoc, a.expiresAtMillis = sealed, wbDoc, a.ExpiresAt != rawExpires
+	}
 	return &a, nil
 }
 
@@ -575,40 +573,34 @@ func (a *Auth) docLocked() credDoc {
 		deviceToken:  a.DeviceToken,
 		epoch:        a.credEpoch,
 	}
-}
-
-// writeLocked 把 doc 原子写到 a.FilePath（仅限**已持 a.mu** 的调用方；
-// 调用方负责 FilePath 非空与 accessToken 非空的前置校验）。
-func (a *Auth) writeLocked(d credDoc) error {
-	doc := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  d.accessToken,
-			"refreshToken": d.refreshToken,
-			"expiresAt":    d.expiresAt,
-			"domain":       d.domain,
-			"realm":        d.realm,
-		},
-		"account": map[string]any{
-			"uid":          d.uid,
-			"enterpriseId": d.enterpriseID,
-			"nickname":     d.nickname,
-		},
-	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if d.deviceToken != "" {
-		doc["device_token"] = d.deviceToken
-	}
-	// epoch 同理：0 不写，避免所有存量账号的每次 refresh 都给文件新增一个键。
-	if d.epoch > 0 {
-		if authObj, ok := doc["auth"].(map[string]any); ok {
-			authObj["epoch"] = d.epoch
+	var doc map[string]any
+	if len(a.wbSealed) > 0 {
+		// 来源是桌面端的加密文件：以解密后的原文档为底回写，再按读入时的信封清单复原
+		// （见 sealForSave）。封装失败就拒绝落盘——明文覆盖加密文件比写不进去更糟。
+		doc = a.wbOverlayLocked()
+		if err := sealForSave(doc, a.wbSealed); err != nil {
+			return err
 		}
-	}
-	// 来源文件加密的，回写也保持加密：按读入时的信封清单复原（见 sealForSave）。
-	// 封装失败就拒绝落盘——明文降级覆盖加密文件比写不进去更糟。
-	if err := sealForSave(doc, a.wbSealed); err != nil {
-		return err
+	} else {
+		doc = map[string]any{
+			"auth": map[string]any{
+				"accessToken":  a.AccessToken,
+				"refreshToken": a.RefreshToken,
+				"expiresAt":    a.ExpiresAt,
+				"domain":       a.Domain,
+				"realm":        a.realm,
+			},
+			"account": map[string]any{
+				"uid":          a.UID,
+				"enterpriseId": a.EnterpriseID,
+				"nickname":     a.Nickname,
+			},
+		}
+		// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
+		// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+		if a.DeviceToken != "" {
+			doc["device_token"] = a.DeviceToken
+		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -631,138 +623,59 @@ func (a *Auth) writeLocked(d credDoc) error {
 	return nil
 }
 
-// saveAtomicLocked SaveAtomic 的无锁内部实现（仅限**已持 a.mu** 的调用方）。
-func (a *Auth) saveAtomicLocked() error {
-	if strings.TrimSpace(a.AccessToken) == "" {
-		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
+// wbOverlayLocked 加密来源文件的回写底稿：解密后原文档的副本，把本包管理的字段写回它们
+// 原来的位置（嵌套形在 auth / account 下，扁平形在顶层）。原文没有、值又为空的字段不新增，
+// 其余桌面端字段原样保留；expiresAt 按来源的单位写回。调用方持 a.mu。
+func (a *Auth) wbOverlayLocked() map[string]any {
+	doc := cloneJSON(a.wbDoc).(map[string]any)
+	authObj, nested := doc["auth"].(map[string]any)
+	accObj := doc
+	if nested {
+		if accObj, _ = doc["account"].(map[string]any); accObj == nil {
+			accObj = map[string]any{}
+			doc["account"] = accObj
+		}
+	} else {
+		authObj = doc
 	}
-	if a.FilePath == "" {
-		return fmt.Errorf("no FilePath set")
+	set := func(m map[string]any, k string, v any, empty bool) {
+		if _, has := m[k]; has || !empty {
+			m[k] = v
+		}
 	}
-	return a.writeLocked(a.docLocked())
+	exp := a.ExpiresAt
+	if a.expiresAtMillis {
+		exp *= 1000
+	}
+	set(authObj, "accessToken", a.AccessToken, false)
+	set(authObj, "refreshToken", a.RefreshToken, a.RefreshToken == "")
+	set(authObj, "expiresAt", exp, a.ExpiresAt == 0)
+	set(authObj, "domain", a.Domain, a.Domain == "")
+	set(authObj, "realm", a.realm, a.realm == "")
+	set(accObj, "uid", a.UID, a.UID == "")
+	set(accObj, "enterpriseId", a.EnterpriseID, a.EnterpriseID == "")
+	set(accObj, "nickname", a.Nickname, a.Nickname == "")
+	set(doc, "device_token", a.DeviceToken, a.DeviceToken == "")
+	return doc
 }
 
-// AdoptCredentials 用 src 的凭据**原位整体替换** a 的凭据，用于「401 失效账号
-// 重新登录」：账号身份、账号池条目、历史统计、优先级/份额/路由配置全部保持不变，
-// 只换认证域（token / 过期时间 / 身份展示 / realm）。
-//
-// 单次持锁事务，顺序不可换：
-//  1. 校验（空 token 拒绝；UID 双方均非空且不等 → 拒绝覆盖，防串号）；
-//  2. **先落盘**到 a.FilePath（沿用原账号文件，绝不产生第二个凭证文件）；
-//  3. 写盘成功后，才修改内存字段；
-//  4. credEpoch + 1。
-//
-// 写盘失败时 a 的任何字段都不变、代次不变 —— 调用方可以放心把错误报给用户，
-// 旧凭证与账号状态完好（不存在"内存已换、文件还是旧的"或假成功）。
-//
-// 保留项（重登录不该抹掉的东西）：
-//   - FilePath：原账号文件路径（不重新拼 workbuddy-<uid>.json，避免同名 UID
-//     在多 realm / 手工改名场景下写出第二个文件）；
-//   - DeviceToken：src 未携带时沿用旧值（重登只换 OAuth 凭据，桌面端设备风控
-//     token 与本账号绑定，丢了会让出站请求被打上"非官方客户端"）；
-//   - realm：src 未给出时沿用旧值（realm 由 panel 依原账号推导后显式写入，
-//     src 为空只可能来自测试或旧调用方）。
-//
-// src 必须是**新建且未被共享**的对象（panel 登录流程里刚构造出来的凭证）；
-// 本方法对它只做一次字段快照，不改写它。
-func (a *Auth) AdoptCredentials(src *Auth) error {
-	if a == nil || src == nil {
-		return fmt.Errorf("adopt credentials: nil auth")
-	}
-	if a == src {
-		// 自我替换会把「先锁 src 再锁 a」变成自锁（sync.Mutex 不可重入）。
-		return fmt.Errorf("adopt credentials: src is the same object as target")
-	}
-	// src 快照（逐字段拷贝，不整体复制含 sync.Mutex 的结构体）。
-	src.mu.Lock()
-	next := credDoc{
-		accessToken:  src.AccessToken,
-		refreshToken: src.RefreshToken,
-		expiresAt:    src.ExpiresAt,
-		domain:       src.Domain,
-		realm:        src.realm,
-		uid:          src.UID,
-		enterpriseID: src.EnterpriseID,
-		nickname:     src.Nickname,
-		deviceToken:  src.DeviceToken,
-	}
-	src.mu.Unlock()
-
-	if strings.TrimSpace(next.accessToken) == "" {
-		return fmt.Errorf("adopt credentials: empty accessToken (uid=%s)", next.uid)
-	}
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	// 身份安全闸：目标账号已有 UID 时，新凭据的 UID 必须一致。
-	// 上游返回的 UID 未经此校验就写入磁盘 = 把别的账号的凭据写到本账号文件上，
-	// 两个账号同时持有对方 token，排查起来极难（日志里只看到某个 uid 的请求 401）。
-	if a.UID != "" && next.uid != "" && a.UID != next.uid {
-		return fmt.Errorf("adopt credentials: uid mismatch (target=%s new=%s)，拒绝覆盖", a.UID, next.uid)
-	}
-	if next.uid == "" {
-		next.uid = a.UID
-	}
-	if a.FilePath == "" {
-		if src.FilePath == "" {
-			return fmt.Errorf("adopt credentials: no FilePath set (uid=%s)", a.UID)
+// cloneJSON 深拷贝 JSON 解码出的值（map / slice 递归，其余是不可变的标量）。
+func cloneJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(t))
+		for k, x := range t {
+			m[k] = cloneJSON(x)
 		}
-		a.FilePath = src.FilePath
+		return m
+	case []any:
+		s := make([]any, len(t))
+		for i, x := range t {
+			s[i] = cloneJSON(x)
+		}
+		return s
 	}
-	// —— 身份与展示字段：重新登录**不改**（唯一例外：目标账号原本就缺该字段）——
-	//
-	// 这不是"图省事"：UID / Nickname / EnterpriseID 在仓库里有大量**无锁**读点
-	// （面板任务中心、autotask、taskjobs、状态渲染都直接读 a.UID / a.Nickname），
-	// 而 AdoptCredentials 只持 a.mu。若重登改写它们，就与那些读者构成数据竞争
-	// （go test -race 已实测到 UID 的竞争）。改成"重登只换凭据，不换身份"后：
-	//   - 竞争面消失（这几个字段装载后不再变）；
-	//   - 落盘与内存一致（写文件也取同样的值，不会出现"文件里新昵称、内存里旧昵称"）。
-	// 真需要更新昵称/企业标识时，那是"重新导入/重加账号"的语义，不是重登。
-	if a.UID != "" {
-		next.uid = a.UID
-	}
-	next.nickname = a.Nickname
-	next.enterpriseID = a.EnterpriseID
-	// 保留项合并。
-	if next.deviceToken == "" {
-		next.deviceToken = a.DeviceToken
-	}
-	if strings.TrimSpace(next.realm) == "" {
-		next.realm = a.realm
-	}
-	// 代次在落盘**之前**定稿：文件里写的就是「替换完成后内存里的代次」，
-	// 两者必须一致，否则重启对账（pool.reconcileCredEpochLocked）会误判。
-	next.epoch = a.credEpoch + 1
-
-	// 先落盘：失败直接返回，下面任何一行都不会执行到。
-	if err := a.writeLocked(next); err != nil {
-		return err
-	}
-
-	// 盘上已是新凭据，再换内存。此刻若有在途 refresh 正持旧代次等锁，它会在
-	// 拿到锁后发现 credEpoch 已变而丢弃结果（见 upstream.applyRefresh）。
-	a.AccessToken = next.accessToken
-	a.RefreshToken = next.refreshToken
-	a.ExpiresAt = next.expiresAt
-	a.Domain = next.domain
-	a.realm = next.realm
-	// 身份/展示字段只在目标原本为空时补全（见上方说明），常见路径不写：
-	// 避免与面板/任务中心那些无锁读者构成数据竞争。
-	if a.UID == "" {
-		a.UID = next.uid
-	}
-	if a.EnterpriseID == "" {
-		a.EnterpriseID = next.enterpriseID
-	}
-	if a.Nickname == "" {
-		a.Nickname = next.nickname
-	}
-	if a.DeviceToken != next.deviceToken {
-		a.DeviceToken = next.deviceToken
-	}
-	a.credEpoch++
-	return nil
+	return v
 }
 
 // SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
@@ -782,6 +695,39 @@ func (a *Auth) SaveAtomicRetry() error {
 		}
 	}
 	return err
+}
+
+// AdoptNewer 用 src（同一账号从磁盘新读出的凭证）原地更新 a，仅当 src 的令牌更新时才动。
+// 返回是否更新。
+//
+// 为什么原地改而不是换指针：池里的 *Auth 被在途请求与令牌刷新共享，刷新在 a.mu 内原地
+// 写新令牌。换成一个从文件读出的新对象有两种坏结果：扫描早于刷新写回时，新对象带的是
+// 已被轮换作废的 refresh token；刷新还在旧对象上进行时，结果写进了没人用的对象。
+// 所以只在锁内、只在磁盘上的令牌更新（过期时刻更晚，典型为外部重新登录）时拷字段。
+// 过期时刻都为 0 的静态 API Key 以令牌不同为准。
+func (a *Auth) AdoptNewer(src *Auth) bool {
+	if a == src {
+		return false
+	}
+	src.mu.Lock()
+	in := Auth{
+		AccessToken: src.AccessToken, RefreshToken: src.RefreshToken, ExpiresAt: src.ExpiresAt,
+		Domain: src.Domain, realm: src.realm, EnterpriseID: src.EnterpriseID,
+		Nickname: src.Nickname, DeviceToken: src.DeviceToken, wbSealed: src.wbSealed,
+	}
+	src.mu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if in.AccessToken == "" || in.AccessToken == a.AccessToken {
+		return false
+	}
+	if in.ExpiresAt <= a.ExpiresAt && !(in.ExpiresAt == 0 && a.ExpiresAt == 0) {
+		return false
+	}
+	a.AccessToken, a.RefreshToken, a.ExpiresAt = in.AccessToken, in.RefreshToken, in.ExpiresAt
+	a.Domain, a.realm, a.EnterpriseID = in.Domain, in.realm, in.EnterpriseID
+	a.Nickname, a.DeviceToken, a.wbSealed = in.Nickname, in.DeviceToken, in.wbSealed
+	return true
 }
 
 // LoadReport 一次账号目录扫描的结果。
@@ -808,10 +754,19 @@ func LoadDir(dir string) ([]*Auth, error) {
 }
 
 // LoadDirReport 同 LoadDir，另外回报文件数与解析失败的条目（热重载用来判断能否删号）。
+//
+// 目录不存在视为空目录；其余读目录错误（挂载掉了、权限丢了）原样返回。filepath.Glob 会把
+// 这类 I/O 错误吞成「0 个文件」，热重载随后就把整个池删光，所以这里改用 os.ReadDir。
 func LoadDirReport(dir string) (LoadReport, error) {
-	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
-	if err != nil {
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return LoadReport{}, err
+	}
+	var files []string
+	for _, e := range entries {
+		if ok, _ := filepath.Match("workbuddy*.json", e.Name()); ok && !e.IsDir() {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
 	}
 	report := LoadReport{Files: len(files)}
 	// 按 mtime 升序：同一个号的轮转备份并存时（客户端会写 <name>.<ts>.<pid>.<uuid>.info），
@@ -858,16 +813,25 @@ func LoadDirReport(dir string) (LoadReport, error) {
 				logfmt.Label(a.UID, a.Nickname), prev.file, prev.eid, f, a.EnterpriseID)
 		}
 		seenUID[a.UID] = dupUID{file: f, eid: a.EnterpriseID}
-		if a.RealmStored() == "" {
-			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
-				} else if r == "global" {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
-				}
+		out = append(out, a)
+	}
+	// 只给每个 uid 胜出的那份（mtime 最新、最后载入）做 realm 迁移落盘：给落败的旧文件写盘会
+	// 刷新它的 mtime，下次启动它就成了「最新」，胜负来回翻。
+	winner := make(map[string]*Auth, len(out))
+	for _, a := range out {
+		winner[a.UID] = a
+	}
+	for _, a := range out {
+		if winner[a.UID] != a || a.RealmStored() != "" {
+			continue
+		}
+		if changed, r := a.BackfillRealm(); changed {
+			if err := a.SaveAtomic(); err != nil {
+				log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
+			} else if r == "global" {
+				log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
 			}
 		}
-		out = append(out, a)
 	}
 	report.Auths = out
 	return report, nil
