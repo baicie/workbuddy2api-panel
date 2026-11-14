@@ -56,6 +56,11 @@ type Auth struct {
 	wbSealed        map[string]bool
 	wbDoc           map[string]any
 	expiresAtMillis bool
+	// credEpoch 凭证代次：凭据被**整体替换**（401 失效账号原点重新登录）时 +1，
+	// 受 a.mu 保护。在途 refresh 发起时记下代次，写回前发现代次已变即丢弃本次结果
+	// （成功与失败都丢）：那次刷新拿的是**旧** RefreshToken，照写会把刚落盘的新凭证
+	// 覆盖回旧凭证，重登录等于白做。
+	credEpoch uint64
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -573,33 +578,52 @@ func (a *Auth) docLocked() credDoc {
 		deviceToken:  a.DeviceToken,
 		epoch:        a.credEpoch,
 	}
+}
+
+// writeLocked 把 doc 原子写到 a.FilePath（仅限**已持 a.mu** 的调用方；
+// 调用方负责 FilePath 非空与 accessToken 非空的前置校验）。
+func (a *Auth) writeLocked(d credDoc) error {
+	// 来源是桌面端加密文件时，以**解密后的原文档**为底回写：桌面端自己的字段
+	// （phoneNumber、uin 等）与原有形态（嵌套/扁平）都保留，再按 a.wbSealed
+	// 复原信封。否则写标准嵌套形。
 	var doc map[string]any
-	if len(a.wbSealed) > 0 {
-		// 来源是桌面端的加密文件：以解密后的原文档为底回写，再按读入时的信封清单复原
-		// （见 sealForSave）。封装失败就拒绝落盘——明文覆盖加密文件比写不进去更糟。
-		doc = a.wbOverlayLocked()
-		if err := sealForSave(doc, a.wbSealed); err != nil {
-			return err
-		}
+	if len(a.wbSealed) > 0 && a.wbDoc != nil {
+		doc = a.wbOverlayFromLocked(d)
 	} else {
 		doc = map[string]any{
-			"auth": map[string]any{
-				"accessToken":  a.AccessToken,
-				"refreshToken": a.RefreshToken,
-				"expiresAt":    a.ExpiresAt,
-				"domain":       a.Domain,
-				"realm":        a.realm,
+				"auth": map[string]any{
+				"accessToken":  d.accessToken,
+				"refreshToken": d.refreshToken,
+				"expiresAt":    d.expiresAt,
+				"domain":       d.domain,
+				"realm":        d.realm,
 			},
 			"account": map[string]any{
-				"uid":          a.UID,
-				"enterpriseId": a.EnterpriseID,
-				"nickname":     a.Nickname,
+				"uid":          d.uid,
+				"enterpriseId": d.enterpriseID,
+				"nickname":     d.nickname,
 			},
 		}
 		// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 		// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-		if a.DeviceToken != "" {
-			doc["device_token"] = a.DeviceToken
+		if d.deviceToken != "" {
+			doc["device_token"] = d.deviceToken
+		}
+		// epoch 同理：0 不写，避免所有存量账号的每次 refresh 都给文件新增一个键。
+		if d.epoch > 0 {
+			if authObj, ok := doc["auth"].(map[string]any); ok {
+				authObj["epoch"] = d.epoch
+			}
+		}
+	}
+	// 来源文件加密的，回写也保持加密：按读入时的信封清单复原（见 sealForSave）。
+	// 封装失败就拒绝落盘——明文降级覆盖加密文件比写不进去更糟。
+	//
+	// 必须判空：新版 sealForSave 会**无条件**把 accessToken/refreshToken 封装成信封
+	// （它假定调用方只在 sealed 非空时调用），对普通明文文件照调会把凭据写成密文。
+	if len(a.wbSealed) > 0 {
+		if err := sealForSave(doc, a.wbSealed); err != nil {
+			return err
 		}
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
@@ -621,6 +645,181 @@ func (a *Auth) docLocked() credDoc {
 		return errors.New(msg)
 	}
 	return nil
+}
+
+// saveAtomicLocked SaveAtomic 的无锁内部实现（仅限**已持 a.mu** 的调用方）。
+func (a *Auth) saveAtomicLocked() error {
+	if strings.TrimSpace(a.AccessToken) == "" {
+		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
+	}
+	if a.FilePath == "" {
+		return fmt.Errorf("no FilePath set")
+	}
+	if os.Getenv("WB_DBG_SAVE") != "" {
+		log.Printf("DBG SaveAtomic uid=%s sealed=%d file=%s", a.UID, len(a.wbSealed), a.FilePath)
+	}
+	return a.writeLocked(a.docLocked())
+}
+
+// AdoptCredentials 用 src 的凭据**原位整体替换** a 的凭据，用于「401 失效账号
+// 重新登录」：账号身份、账号池条目、历史统计、优先级/份额/路由配置全部保持不变，
+// 只换认证域（token / 过期时间 / 身份展示 / realm）。
+//
+// 单次持锁事务，顺序不可换：
+//  1. 校验（空 token 拒绝；UID 双方均非空且不等 → 拒绝覆盖，防串号）；
+//  2. **先落盘**到 a.FilePath（沿用原账号文件，绝不产生第二个凭证文件）；
+//  3. 写盘成功后，才修改内存字段；
+//  4. credEpoch + 1。
+//
+// 写盘失败时 a 的任何字段都不变、代次不变 —— 调用方可以放心把错误报给用户，
+// 旧凭证与账号状态完好（不存在"内存已换、文件还是旧的"或假成功）。
+//
+// 保留项（重登录不该抹掉的东西）：
+//   - FilePath：原账号文件路径（不重新拼 workbuddy-<uid>.json，避免同名 UID
+//     在多 realm / 手工改名场景下写出第二个文件）；
+//   - DeviceToken：src 未携带时沿用旧值（重登只换 OAuth 凭据，桌面端设备风控
+//     token 与本账号绑定，丢了会让出站请求被打上"非官方客户端"）；
+//   - realm：src 未给出时沿用旧值（realm 由 panel 依原账号推导后显式写入，
+//     src 为空只可能来自测试或旧调用方）。
+//
+// src 必须是**新建且未被共享**的对象（panel 登录流程里刚构造出来的凭证）；
+// 本方法对它只做一次字段快照，不改写它。
+func (a *Auth) AdoptCredentials(src *Auth) error {
+	if a == nil || src == nil {
+		return fmt.Errorf("adopt credentials: nil auth")
+	}
+	if a == src {
+		// 自我替换会把「先锁 src 再锁 a」变成自锁（sync.Mutex 不可重入）。
+		return fmt.Errorf("adopt credentials: src is the same object as target")
+	}
+	// src 快照（逐字段拷贝，不整体复制含 sync.Mutex 的结构体）。
+	src.mu.Lock()
+	next := credDoc{
+		accessToken:  src.AccessToken,
+		refreshToken: src.RefreshToken,
+		expiresAt:    src.ExpiresAt,
+		domain:       src.Domain,
+		realm:        src.realm,
+		uid:          src.UID,
+		enterpriseID: src.EnterpriseID,
+		nickname:     src.Nickname,
+		deviceToken:  src.DeviceToken,
+	}
+	src.mu.Unlock()
+
+	if strings.TrimSpace(next.accessToken) == "" {
+		return fmt.Errorf("adopt credentials: empty accessToken (uid=%s)", next.uid)
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// 身份安全闸：目标账号已有 UID 时，新凭据的 UID 必须一致。
+	// 上游返回的 UID 未经此校验就写入磁盘 = 把别的账号的凭据写到本账号文件上，
+	// 两个账号同时持有对方 token，排查起来极难（日志里只看到某个 uid 的请求 401）。
+	if a.UID != "" && next.uid != "" && a.UID != next.uid {
+		return fmt.Errorf("adopt credentials: uid mismatch (target=%s new=%s)，拒绝覆盖", a.UID, next.uid)
+	}
+	if next.uid == "" {
+		next.uid = a.UID
+	}
+	if a.FilePath == "" {
+		if src.FilePath == "" {
+			return fmt.Errorf("adopt credentials: no FilePath set (uid=%s)", a.UID)
+		}
+		a.FilePath = src.FilePath
+	}
+	// —— 身份与展示字段：重新登录**不改**（唯一例外：目标账号原本就缺该字段）——
+	//
+	// 这不是"图省事"：UID / Nickname / EnterpriseID 在仓库里有大量**无锁**读点
+	// （面板任务中心、autotask、taskjobs、状态渲染都直接读 a.UID / a.Nickname），
+	// 而 AdoptCredentials 只持 a.mu。若重登改写它们，就与那些读者构成数据竞争
+	// （go test -race 已实测到 UID 的竞争）。改成"重登只换凭据，不换身份"后：
+	//   - 竞争面消失（这几个字段装载后不再变）；
+	//   - 落盘与内存一致（写文件也取同样的值，不会出现"文件里新昵称、内存里旧昵称"）。
+	// 真需要更新昵称/企业标识时，那是"重新导入/重加账号"的语义，不是重登。
+	if a.UID != "" {
+		next.uid = a.UID
+	}
+	next.nickname = a.Nickname
+	next.enterpriseID = a.EnterpriseID
+	// 保留项合并。
+	if next.deviceToken == "" {
+		next.deviceToken = a.DeviceToken
+	}
+	if strings.TrimSpace(next.realm) == "" {
+		next.realm = a.realm
+	}
+	// 代次在落盘**之前**定稿：文件里写的就是「替换完成后内存里的代次」，
+	// 两者必须一致，否则重启对账（pool.reconcileCredEpochLocked）会误判。
+	next.epoch = a.credEpoch + 1
+
+	// 先落盘：失败直接返回，下面任何一行都不会执行到。
+	if err := a.writeLocked(next); err != nil {
+		return err
+	}
+
+	// 盘上已是新凭据，再换内存。此刻若有在途 refresh 正持旧代次等锁，它会在
+	// 拿到锁后发现 credEpoch 已变而丢弃结果（见 upstream.applyRefresh）。
+	a.AccessToken = next.accessToken
+	a.RefreshToken = next.refreshToken
+	a.ExpiresAt = next.expiresAt
+	a.Domain = next.domain
+	a.realm = next.realm
+	// 身份/展示字段只在目标原本为空时补全（见上方说明），常见路径不写：
+	// 避免与面板/任务中心那些无锁读者构成数据竞争。
+	if a.UID == "" {
+		a.UID = next.uid
+	}
+	if a.EnterpriseID == "" {
+		a.EnterpriseID = next.enterpriseID
+	}
+	if a.Nickname == "" {
+		a.Nickname = next.nickname
+	}
+	if a.DeviceToken != next.deviceToken {
+		a.DeviceToken = next.deviceToken
+	}
+	a.credEpoch++
+	return nil
+}
+
+// wbOverlayFromLocked 用待落盘快照 d 覆盖解密后原文档的受管字段（保留其余桌面端
+// 字段与嵌套/扁平形态），供 writeLocked 在加密来源上回写。调用方持 a.mu。
+func (a *Auth) wbOverlayFromLocked(d credDoc) map[string]any {
+	doc := cloneJSON(a.wbDoc).(map[string]any)
+	authObj, nested := doc["auth"].(map[string]any)
+	accObj := doc
+	if nested {
+		if accObj, _ = doc["account"].(map[string]any); accObj == nil {
+			accObj = map[string]any{}
+			doc["account"] = accObj
+		}
+	} else {
+		authObj = doc
+	}
+	exp := d.expiresAt
+	if a.expiresAtMillis {
+		exp *= 1000
+	}
+	set := func(m map[string]any, k string, v any, empty bool) {
+		if _, has := m[k]; has || !empty {
+			m[k] = v
+		}
+	}
+	set(authObj, "accessToken", d.accessToken, false)
+	set(authObj, "refreshToken", d.refreshToken, d.refreshToken == "")
+	set(authObj, "expiresAt", exp, d.expiresAt == 0)
+	set(authObj, "domain", d.domain, d.domain == "")
+	set(authObj, "realm", d.realm, d.realm == "")
+	set(accObj, "uid", d.uid, d.uid == "")
+	set(accObj, "enterpriseId", d.enterpriseID, d.enterpriseID == "")
+	set(accObj, "nickname", d.nickname, d.nickname == "")
+	set(doc, "device_token", d.deviceToken, d.deviceToken == "")
+	if d.epoch > 0 {
+		authObj["epoch"] = d.epoch
+	}
+	return doc
 }
 
 // wbOverlayLocked 加密来源文件的回写底稿：解密后原文档的副本，把本包管理的字段写回它们

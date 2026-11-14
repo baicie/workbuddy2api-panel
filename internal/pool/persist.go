@@ -422,18 +422,26 @@ func (p *Pool) stateOverviewLocked() stateFile {
 // stateOf 一个条目的持久化形态（落盘与快照镜像共用）。调用方持 p.mu。
 func stateOf(e *entry, now time.Time) stateAccount {
 	s := stateAccount{
-		Credits:                  e.credits,
-		CreditsRemainder:         e.creditsRemainder,
-		CreditsTotal:             e.creditsTotal,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		Group:                    e.group,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		LastSuccess:              e.lastSuccess,
-		LastErr:                  e.lastErr,
-		LastCheckinDay:           e.lastCheckinDay,
-		TokenUsage:               e.tokenUsage,
+		Credits:          e.credits,
+		CreditsRemainder: e.creditsRemainder,
+		CreditsTotal:     e.creditsTotal,
+		Disabled:         e.disabled,
+		Paused:           e.paused,
+		Group:            e.group,
+		SuccessCount:     e.successCount,
+		ErrTotal:         e.errTotal,
+		LastSuccess:      e.lastSuccess,
+		LastErr:          e.lastErr,
+		LastCheckinDay:   e.lastCheckinDay,
+		TokenUsage:       e.tokenUsage,
+		// AuthEpoch 凭证代次必须落盘：重启时与 auth 文件里的 auth.epoch 对账，
+		// 判断「凭据是否比 state 记录的新」（见 authfault.go 的启动对账）。
+		// 漏写会让每次重启都把代次读成 0，对账永远判「文件更新」，告警刷屏。
+		AuthEpoch: e.authEpoch,
+		// AuthFault/AuthFaultAt 类型化认证故障：落盘后重启仍能给出「需重登」入口
+		// 与禁用原因（上游把保存逻辑搬进 stateOf 时这两个赋值被漏掉了）。
+		AuthFault:                e.authFault,
+		AuthFaultAt:              e.authFaultAt,
 		SoftStreak:               e.softStreak,
 		SessionDeadFails:         e.sessionDeadFails,
 		ConsecutiveFails:         e.consecutiveFails,
@@ -448,6 +456,11 @@ func stateOf(e *entry, now time.Time) stateAccount {
 	if e.disabled || (!e.until.IsZero() && now.Before(e.until)) {
 		s.Reason, s.Until, s.CoolKind = e.reason, e.until, e.coolKind
 		s.DisabledAt = e.disabledAt
+	}
+	// 禁用成因只在禁用时落盘（未禁用时成因无意义，留着会让 state.json 出现
+	// 「disabled=false 但 cause=admin」的脏组合）。
+	if e.disabled {
+		s.DisabledCause = e.disabledCause
 	}
 	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
