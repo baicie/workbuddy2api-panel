@@ -354,9 +354,12 @@ func NewHandler(cfg Config) *Handler {
 // 行日志/归档/来源采集/X-Request-Id——一视同仁，别再按单路径放行（Codex 走
 // /v1/responses，曾因此整类请求无来源、不入归档）。
 //
-// 出图/出视频/3D 也在表里：它们不扣 chat 的 token，但同样按上游回执扣积分，
-// 不进台账就等于面板拿不到这笔钱（issue #249）——POST /v1/videos 与
-// /v1/videos/generations 是同一个 handler，曾只登记了后者。
+// 进表的标准是「**任何被代理到上游的 POST**」，不是「会不会扣积分」：出图/出视频/3D
+// 按上游回执扣积分，不进台账等于面板拿不到这笔钱（issue #249）；检索/抓取/嵌入不扣
+// 积分，但同样是一次真实的出网调用，不进台账就成了「出问题面板零痕迹」的盲区
+// （issue #275：8 天 22573 条归档里 /v1/search 与 /v1/fetch 一条都没有，免费检索
+// 的调用量、失败率、耗时、来源 IP/UA 全部不可见）。这两类只是 credit 记 0，不影响
+// 任何记账口径。
 //
 // GET 的查询路径（/v1/videos/{id}、/content）刻意不在表里：ServeHTTP 只对 POST 挂
 // trace，轮询不扣费，进归档只会把一次生成摊成 N 条 0 积分记录。
@@ -365,7 +368,8 @@ func isChatEntry(path string) bool {
 	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/messages",
 		"/v1/images/generations", "/v1/images/edits",
 		"/v1/videos", "/v1/videos/generations", "/v1/videos/tasks",
-		"/v1/3d/generations", "/v1/3d/tasks":
+		"/v1/3d/generations", "/v1/3d/tasks",
+		"/v1/search", "/v1/fetch", "/v1/embeddings":
 		return true
 	}
 	return false
@@ -1191,6 +1195,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// noPick 选号失败的成因拆解（issue #276）：15 个号有余额却只看到 no_healthy_account
+	// 时，得能从响应本身看出是谁挡的（保留积分/保底/在途/冷却/已试过）。
+	var noPick pool.NoPick
 	// busyWaited 本次请求是否已经为「模型繁忙」等过一轮（issue #46，见 acct==nil 分支）。
 	busyWaited := false
 	// queueWaited 本次请求是否已经为 6020/6021 渠道排队等过一轮（见 ErrUpstreamBusy 分支）。
@@ -1506,7 +1513,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 在这里取一次快照，供下方错误构造区分；按 realm 统计，否则另一域的
 			// 健康号会把「本域全被模型级冷却挡住」掩盖成还有号可服务。
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(curModel, realm)
-			h.logNoSelectable(realm, curModel, modelBlock.Blocked)
+			noPick = h.cfg.Pool.NoPickForRealm(curModel, realm, tried)
+			h.logNoSelectable(realm, curModel, modelBlock.Blocked, noPick)
 			break
 		}
 		st.uid = acct.UID
@@ -1894,6 +1902,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// max_tokens 补回可用值（与出站抬额度同一口径、按目录封顶，见 upstream.OutputBudgetFloor）。
 			cont := newContinueReaderWithFloor(r.Context(), h.cfg.Upstream, acct, body, clientIP, chatMeta, rc,
 				h.cfg.Upstream.OutputBudgetFloor(acct.Realm(), curModel, hopTiming.Effort))
+			cont.narrationOff = h.loadLive().NarrationOff
 			defer cont.Close()
 			stats := newChatStatsReaderSince(cont, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
@@ -2361,6 +2370,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			msg = "this model is not allowed for any account in this group (model rules); try another model"
 			hint = fmt.Sprintf("model_rules: %d/%d account(s) blocked by model rules", blocked, eligible)
 		}
+	}
+	// 成因拆解（issue #276）：有号却选不到时，把五类计数直接塞进 gateway_hint —— 用户
+	// 不必登服务器翻日志就知道该充钱（reserve）、调阈值（floor）、提并发（in_flight_full）
+	// 还是等冷却（cooling）。同一件事此前只有一个 no_healthy_account。
+	if code == "no_healthy_account" && noPick.Total > 0 {
+		if hint != "" {
+			hint += "; "
+		}
+		hint += "no_pick{" + noPick.String() + "}"
 	}
 	if proxypool.IsError(lastErr) {
 		status, code, msg, hint = http.StatusServiceUnavailable, "proxy_unavailable", lastErr.Error(), ""
