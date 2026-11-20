@@ -4,7 +4,7 @@
 //	POST /v1/audio/transcriptions  语音转文本（multipart，字段 file 或 audio）
 //
 // 上游的两个端点不在 /v1/models 目录里（是独立端点，不是模型），协议来自官方桌面端
-// 包内 `main/server.js` 的静态反查（issue #277）：`/v2/audio/speech`（SSE + PCM）与
+// 包内 `main/server.js` 的静态反查 + 真号跑通（issue #277）：`/v2/audio/speech`（SSE + PCM）与
 // `/agenttool/v1/asr`（multipart）。**未做真机抓包对照**，故默认关闭：关着时回 403
 // （功能存在、只是没开），不是 404。
 //
@@ -33,6 +33,10 @@ import (
 
 // audioAttempts 失败换号上限（与 search/embeddings 同量级）。
 const audioAttempts = 3
+
+// maxAudioBytes 上游 ASR 的硬上限 3MB（2026-11-20 实测：2.9MB 通过，3.1MB 回
+// 15052 "ensure file size is under 3MB"）。在入口挡掉，比让上游判 multipart 解析失败干净。
+const maxAudioBytes = 3 << 20
 
 type speechRequest struct {
 	// Model 只用来取 realm 前缀（OpenAI 客户端填的是 tts-1 之类的占位名，不转发上游：
@@ -156,7 +160,8 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 					status = http.StatusBadRequest
 				}
 				log.Printf("speech realm=%s: 请求级错误 kind=%v，不再换号", realm, ue.Kind)
-				writeOpenAIError(w, status, "upstream_error", ue.Msg)
+				writeOpenAIErrorHint(w, status, "upstream_error", ue.Msg,
+					upstream.GatewayHint(ue.Kind, ue.Msg, upstream.HintContext{}))
 				return
 			}
 		}
@@ -186,7 +191,12 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	audio, err := io.ReadAll(io.LimitReader(file, 32<<20))
+	if fh.Size > maxAudioBytes {
+		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "audio_too_large",
+			fmt.Sprintf("audio is %d bytes, upstream accepts at most 3MB", fh.Size))
+		return
+	}
+	audio, err := io.ReadAll(io.LimitReader(file, maxAudioBytes))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read audio: "+err.Error())
 		return
@@ -223,7 +233,8 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 					status = http.StatusBadRequest
 				}
 				log.Printf("transcriptions realm=%s: 请求级错误 kind=%v，不再换号", realm, ue.Kind)
-				writeOpenAIError(w, status, "upstream_error", ue.Msg)
+				writeOpenAIErrorHint(w, status, "upstream_error", ue.Msg,
+					upstream.GatewayHint(ue.Kind, ue.Msg, upstream.HintContext{}))
 				return
 			}
 		}
