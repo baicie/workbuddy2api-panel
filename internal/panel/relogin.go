@@ -135,7 +135,9 @@ func (p *Panel) reloginStart(w http.ResponseWriter, r *http.Request) {
 	// 这里跟着 loginStart 的写法同步（x-device-token / x-no-* 一整套头）。
 	site := siteForRealm(realm)
 	epState, _, _, _ := loginEndpointsFor(site)
-	data, status, err := doJSON(http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), []byte("{}"), site)
+	// 2026-11-20 上游给 doJSON 加了首个 route 参数（登录出站出口，零值=直连）。
+	// 重新登录路径暂不钉代理出口：沿用直连语义，与本次改动前一致。
+	data, status, err := doJSON(loginRoute{}, http.MethodPost, epState, stateHeaders(site, loginDeviceToken()), []byte("{}"), site)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
