@@ -25,9 +25,17 @@ type Snapshot struct {
 	// NarrationOff 预告式收尾救援是否被关闭（features.narration_enabled 取反）。
 	// 取反是为了让零值 = 开启：没接 livecfg 的裸用/测试路径不必初始化就保持既有行为。
 	NarrationOff bool
+	// LoginBindOff 加号（OAuth 登录）是否**不**绑定号池出口（features.login_bind_proxy
+	// 取反）。取反是为了让零值 = 绑定：没接 livecfg 的裸用/测试路径不必初始化就保持
+	// 默认行为（登录经号池出口，落盘后钉成该号的固定绑定）。
+	LoginBindOff bool
 	// WatermarkStripEnabled 实验特性「水印裁切」总开关（features.watermark_strip_enabled）；
 	// 默认 false，面板保存后热生效。
 	WatermarkStripEnabled bool
+	// TTSEnabled / ASREnabled 官方语音端点开关（features.tts_enabled / asr_enabled）；
+	// 默认 false，关着时回 403（不是 404）。
+	TTSEnabled bool
+	ASREnabled bool
 	// ThreeDEnabled 混元 3D 生成总开关（features.three_d_enabled）；默认 false。
 	// 关着时 /v1/3d/* 回 403、MCP 的 generate_3d / get_3d_task 不出现在工具面里。
 	ThreeDEnabled    bool

@@ -122,6 +122,9 @@ type Config struct {
 	// 默认不落盘。热生效，经 livecfg 快照。
 	RecordContext bool
 
+	// TTSEnabled / ASREnabled 官方语音端点的静态回退（features.tts_enabled / asr_enabled）。
+	TTSEnabled bool
+	ASREnabled bool
 	// EmbeddingsEnabled 实验特性 /v1/embeddings 开关的静态回退（features.embeddings_enabled）。
 	// Live 非 nil 时以热快照为准；裸用/单测路径用本字段。
 	EmbeddingsEnabled bool
@@ -153,6 +156,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		APIKey:                h.cfg.APIKey,
 		SoftCooldown:          h.cfg.SoftCooldown,
 		EmbeddingsEnabled:     h.cfg.EmbeddingsEnabled,
+		TTSEnabled:            h.cfg.TTSEnabled,
+		ASREnabled:            h.cfg.ASREnabled,
 		WatermarkStripEnabled: h.cfg.WatermarkStripEnabled,
 		ThreeDEnabled:         h.cfg.ThreeDEnabled,
 		RecordClientInfo:      h.cfg.RecordClientInfo,
@@ -317,6 +322,10 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddings))
 	// 实验特性：水印裁切（features.watermark_strip_enabled，默认关闭；关着时回 403）。
 	h.mux.HandleFunc("POST /v1/images/strip-watermark", h.withAuth(h.watermarkStrip))
+	// 实验特性：官方语音端点（features.tts_enabled / asr_enabled，默认关闭；关着时回 403）。
+	// 协议来自官方桌面端包的静态反查（见 upstream/speech.go 文件头），未做真机对照。
+	h.mux.HandleFunc("POST /v1/audio/speech", h.withAuth(h.speech))
+	h.mux.HandleFunc("POST /v1/audio/transcriptions", h.withAuth(h.transcriptions))
 	h.mux.HandleFunc("POST /v1/messages", h.withAnthropicAuth(h.messages))
 	h.mux.HandleFunc("POST /messages", h.withAnthropicAuth(h.messages))
 	// Claude Code 上下文将满时会调官方计数端点，上游没有对应接口，这里本地估算
@@ -327,6 +336,13 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/search", h.withAuth(h.search))
 	// DeepSeek Fetch API 形状（DSH 的 web-deepseek-api 把 /search 与 /fetch 指向同一 base）。
 	h.mux.HandleFunc("POST /v1/fetch", h.withAuth(h.fetch))
+	// DeepSeek 官方形状的别名：官方文档的端点是 {base}/v1/tools/search 与
+	// {base}/v1/tools/fetch，与上面两条同一份实现（形状差异见 search.go 的兼容层）。
+	// 别名不是「风格冗余」：dsh-free-search 的 deepseekToolsEndpoint() 会把用户填的
+	// .../v1 强制改写成 .../v1/tools/search，用户无法靠配置绕开；照官方文档填 base
+	// 的客户端同样只会打这个路径。缺了它，这些调用方只能靠「粘贴完整端点」绕。
+	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.search))
+	h.mux.HandleFunc("POST /v1/tools/fetch", h.withAuth(h.fetch))
 	// POST /v2/chat/busy：官方客户端的「模型忙」预检（国区上游 200、国际版上游 404，
 	// 见 busy.go 文件头）。本地按池台账算，不打上游。
 	h.mux.HandleFunc("POST /v2/chat/busy", h.withAuth(h.chatBusy))
@@ -359,7 +375,8 @@ func NewHandler(cfg Config) *Handler {
 // 积分，但同样是一次真实的出网调用，不进台账就成了「出问题面板零痕迹」的盲区
 // （issue #275：8 天 22573 条归档里 /v1/search 与 /v1/fetch 一条都没有，免费检索
 // 的调用量、失败率、耗时、来源 IP/UA 全部不可见）。这两类只是 credit 记 0，不影响
-// 任何记账口径。
+// 任何记账口径。DeepSeek 形状的别名（/v1/tools/search、/v1/tools/fetch）打的是同一
+// 份实现，同样在表内——漏掉它们等于给同一能力留一个「查不到」的后门。
 //
 // GET 的查询路径（/v1/videos/{id}、/content）刻意不在表里：ServeHTTP 只对 POST 挂
 // trace，轮询不扣费，进归档只会把一次生成摊成 N 条 0 积分记录。
@@ -369,7 +386,8 @@ func isChatEntry(path string) bool {
 		"/v1/images/generations", "/v1/images/edits",
 		"/v1/videos", "/v1/videos/generations", "/v1/videos/tasks",
 		"/v1/3d/generations", "/v1/3d/tasks",
-		"/v1/search", "/v1/fetch", "/v1/embeddings":
+		"/v1/search", "/v1/fetch", "/v1/tools/search", "/v1/tools/fetch", "/v1/embeddings",
+		"/v1/audio/speech", "/v1/audio/transcriptions":
 		return true
 	}
 	return false
@@ -2886,11 +2904,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 到这里属防御路径（status>=400 但分类成功），语义不明不喂。
 		if kind == upstream.ErrClient {
 			// 15021 = edgebrowser 的**域名路由策略**拒绝（"domain rejected by via
-			// routing policy"）：域名级判定，同一域名的所有账号返回完全一致的 403，
-			// 与账号健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个
-			// 降到出池（5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
-			// 零动作（/v1/fetch 另有跨域兜底，见 fetch.go）。
-			if upstream.HasCodeMarker(body, "15021") {
+			// routing policy"），15022 = 上游浏览器连不上目标站（ERR_CONNECTION_REFUSED）：
+			// 两者都是域名/边缘级判定，同一 URL 的所有账号返回完全一致的报文，与账号
+			// 健康无关。喂连败会让「连续抓几个 Google 文档」把整个 CN 池逐个降到出池
+			// （5 次达阈）——这不是账号的问题，故与 ErrContentBlocked 同待遇：
+			// 零动作（/v1/fetch 另有换域兜底，见 fetch.go）。
+			if upstream.HasCodeMarker(body, "15021") || upstream.HasCodeMarker(body, "15022") {
 				return
 			}
 			h.cfg.Pool.NoteFailures(uid)
