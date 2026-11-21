@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -190,6 +191,177 @@ func TestTranscriptionsRejectsOversizeAudio(t *testing.T) {
 	}
 	if len(f.paths) != 0 {
 		t.Fatalf("超限时不得打上游: %v", f.paths)
+	}
+}
+
+// TestTranscriptionsCapsRawBody 超大 body 必须在落盘前被钳住（不是解析完再按文件大小拒）：
+// 断言 413、不打上游，且实际读到的字节不超过 maxAudioBytes+audioBodySlack。
+func TestTranscriptionsCapsRawBody(t *testing.T) {
+	f := &audioFake{ctype: "application/json"}
+	p := testPoolWith(&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	h := NewHandler(Config{Pool: p, Upstream: f.client(), ASREnabled: true})
+
+	const total = 64 << 20
+	const head = "--B\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n" +
+		"Content-Type: audio/wav\r\n\r\n"
+	const tail = "\r\n--B--\r\n"
+	body := io.MultiReader(strings.NewReader(head), io.LimitReader(zeroReader{}, total), strings.NewReader(tail))
+	cr := &countingReader{r: body}
+	req := httptest.NewRequest("POST", "/v1/audio/transcriptions", cr)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=B")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "audio_too_large") {
+		t.Fatalf("code=%d body=%s want 413 audio_too_large", rec.Code, rec.Body.String())
+	}
+	if len(f.paths) != 0 {
+		t.Fatalf("超限时不得打上游: %v", f.paths)
+	}
+	// MaxBytesReader 要多读 1 字节才知道超限，故上限 +1。
+	if limit := maxAudioBytes + audioBodySlack + 1; cr.n > limit {
+		t.Fatalf("读了 %d 字节，超过上限 %d（说明先落盘后拒）", cr.n, limit)
+	}
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// TestTranscriptionsResponseFormat OpenAI 的 response_format：默认 json，text 要
+// text/plain 原文（客户端按字符串读时用），带时间戳的形态上游给不了 → 400。
+func TestTranscriptionsResponseFormat(t *testing.T) {
+	f := &audioFake{ctype: "application/json", resp: []byte(`{"code":0,"text":"今天天气不错"}`)}
+	p := testPoolWith(&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	h := NewHandler(Config{Pool: p, Upstream: f.client(), ASREnabled: true})
+
+	send := func(format string) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		part, _ := mw.CreateFormFile("file", "a.wav")
+		_, _ = part.Write([]byte("RIFF....WAVEfmt "))
+		if format != "" {
+			_ = mw.WriteField("response_format", format)
+		}
+		_ = mw.Close()
+		req := httptest.NewRequest("POST", "/v1/audio/transcriptions", &buf)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := send("text"); rec.Code != 200 || rec.Body.String() != "今天天气不错" ||
+		!strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
+		t.Fatalf("text: code=%d ct=%q body=%q", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	if rec := send("json"); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"text"`) {
+		t.Fatalf("json: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := send("verbose_json"); rec.Code != 400 || !strings.Contains(rec.Body.String(), "verbose_json") {
+		t.Fatalf("verbose_json: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestAudioEventsCarryAccount 音频两个端点要进请求台账并带账号/模型，否则查不了
+// 「某个号的 TTS 异常」（issue #277 反馈）。
+func TestAudioEventsCarryAccount(t *testing.T) {
+	f := &audioFake{ctype: "text/event-stream",
+		resp: []byte(`data: {"type":"speech.audio.delta","audio":{"data":"AAEC"}}` + "\n\n" +
+			`data: {"type":"speech.audio.done"}` + "\n\n")}
+	reqLog := reqlog.New(reqlog.Config{})
+	p := testPoolWith(&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"})
+	h := NewHandler(Config{Pool: p, Upstream: f.client(), RequestLog: reqLog, TTSEnabled: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/audio/speech", strings.NewReader(`{"input":"你好"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var got *reqlog.Event
+	for _, e := range reqLog.Snapshot().Recent {
+		if e.Path == "/v1/audio/speech" {
+			e := e
+			got = &e
+		}
+	}
+	if got == nil {
+		t.Fatal("TTS 没进请求台账")
+	}
+	if !strings.Contains(got.Account, "c1") || got.Model != upstream.TTSModel || !got.OK {
+		t.Fatalf("台账缺账号/模型: account=%q model=%q ok=%v", got.Account, got.Model, got.OK)
+	}
+
+	// 截断的 SSE 走失败路径：事件必须带上失败状态（status=0 会被上游健康滑窗记成
+	// 一次无状态采样）。
+	bad := &audioFake{ctype: "text/event-stream",
+		resp: []byte(`data: {"type":"speech.audio.delta","audio":{"data":"AAEC"}}` + "\n\n")}
+	reqLog2 := reqlog.New(reqlog.Config{})
+	h2 := NewHandler(Config{Pool: p, Upstream: bad.client(), RequestLog: reqLog2, TTSEnabled: true})
+	rec = httptest.NewRecorder()
+	h2.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/audio/speech", strings.NewReader(`{"input":"你好"}`)))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("截断的 SSE 应回 502，实际 %d", rec.Code)
+	}
+	for _, e := range reqLog2.Snapshot().Recent {
+		if e.Path == "/v1/audio/speech" && e.Status != http.StatusBadGateway {
+			t.Fatalf("失败事件 status=%d，应为 502", e.Status)
+		}
+	}
+}
+
+// TestSpeechRetriesNextAccountOnTruncatedStream 第一个号的 SSE 在 delta 中途被切断
+// （没有 speech.audio.done），第二个号正常：客户端应拿到这一整段音频，而不是半段。
+//
+// 这是 issue #277 那条「200 + 132480 字节的半段音频」的回归位：修复前 Speech 把
+// EOF-without-done 当成功，第一段半音频就直接 200 出去了，第二个号根本不会被选中。
+func TestSpeechRetriesNextAccountOnTruncatedStream(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	truncated := ttsFrame(map[string]any{"type": "speech.audio.delta",
+		"audio": map[string]string{"data": base64.StdEncoding.EncodeToString(pcm[:4])}})
+	complete := ttsFrame(map[string]any{"type": "speech.audio.delta",
+		"audio": map[string]string{"data": base64.StdEncoding.EncodeToString(pcm[:4])}}) +
+		ttsFrame(map[string]any{"type": "speech.audio.delta",
+			"audio": map[string]string{"data": base64.StdEncoding.EncodeToString(pcm[4:])}}) +
+		ttsFrame(map[string]any{"type": "speech.audio.done"}) + "data: [DONE]\n\n"
+	var seen []string
+	cl := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			seen = append(seen, r.Header.Get("Authorization"))
+			body := truncated
+			if len(seen) > 1 {
+				body = complete
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://cn.example",
+		BillingBaseCN: "https://cn.example",
+	}
+	p := testPoolWith(
+		&auth.Auth{UID: "c1", AccessToken: "at-1", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "c2", AccessToken: "at-2", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: cl, TTSEnabled: true})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/audio/speech",
+		strings.NewReader(`{"input":"你好","response_format":"pcm"}`)))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（换号后应拿到完整音频）", rec.Code, rec.Body.String())
+	}
+	if !bytes.Equal(rec.Body.Bytes(), pcm) {
+		t.Fatalf("PCM=%v want %v（不能把第一段的半截音频回给客户端）", rec.Body.Bytes(), pcm)
+	}
+	if len(seen) != 2 || seen[0] == seen[1] {
+		t.Fatalf("应换到第二个号重试一次，实际调用了 %d 次: %v", len(seen), seen)
 	}
 }
 
