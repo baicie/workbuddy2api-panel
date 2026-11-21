@@ -25,9 +25,11 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/logfmt"
 	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
@@ -37,6 +39,9 @@ const audioAttempts = 3
 // maxAudioBytes 上游 ASR 的硬上限 3MB（2026-11-20 实测：2.9MB 通过，3.1MB 回
 // 15052 "ensure file size is under 3MB"）。在入口挡掉，比让上游判 multipart 解析失败干净。
 const maxAudioBytes = 3 << 20
+
+// audioBodySlack multipart 分帧（boundary + 头字段）的余量。
+const audioBodySlack = 64 << 10
 
 type speechRequest struct {
 	// Model 只用来取 realm 前缀（OpenAI 客户端填的是 tts-1 之类的占位名，不转发上游：
@@ -122,6 +127,17 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 	}
 	realm := audioRealm(req.Realm, req.Model)
 
+	// 记账：与 videos 同一条管道（台账行由 ServeHTTP 的 isChatEntry 接管，这里补
+	// 账号/模型/结果）。校验失败的返回不挂 stat——那些是客户端错误、没选号。
+	start := time.Now()
+	st := &chatStat{start: start, model: upstream.TTSModel, mode: "audio", toks: -1, budget: h.budget}
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+		st.requestID = tr.id
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+	}
+	defer st.done()
+
 	tried := map[string]bool{}
 	var lastErr error
 	for attempt := 0; attempt < audioAttempts; attempt++ {
@@ -130,9 +146,11 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[a.UID] = true
+		st.uid, st.nick, st.realm, st.attempts = a.UID, a.Nickname, realm, attempt+1
 		pcm, err := h.cfg.Upstream.Speech(r.Context(), a, text, req.Voice)
 		if err == nil {
 			if len(pcm) == 0 {
+				st.status, st.outcome = http.StatusBadGateway, reqlog.OutcomeHTTPError
 				log.Printf("speech %s: 上游返回空音频", logfmt.Label(a.UID, a.Nickname))
 				writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no audio")
 				return
@@ -145,6 +163,7 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", ct)
 			w.Header().Set("Content-Length", fmt.Sprint(len(out)))
 			_, _ = w.Write(out)
+			st.status, st.outcome = http.StatusOK, reqlog.OutcomeSuccess
 			return
 		}
 		lastErr = err
@@ -160,6 +179,7 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 					status = http.StatusBadRequest
 				}
 				log.Printf("speech realm=%s: 请求级错误 kind=%v，不再换号", realm, ue.Kind)
+				st.status, st.outcome = status, reqlog.OutcomeHTTPError
 				writeOpenAIErrorHint(w, status, "upstream_error", ue.Msg,
 					upstream.GatewayHint(ue.Kind, ue.Msg, upstream.HintContext{}))
 				return
@@ -167,7 +187,7 @@ func (h *Handler) speech(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("speech %s realm=%s attempt=%d: %v", logfmt.Label(a.UID, a.Nickname), realm, attempt+1, err)
 	}
-	writeAudioFailure(w, "speech", realm, tried, lastErr)
+	st.status, st.outcome = writeAudioFailure(w, "speech", realm, tried, lastErr), reqlog.OutcomeHTTPError
 }
 
 // transcriptions POST /v1/audio/transcriptions：OpenAI 形状的语音转文本。
@@ -180,11 +200,23 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 			"语音识别未开启：请在面板配置里打开 features.asr_enabled（默认关闭）")
 		return
 	}
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// 先钳住请求体再解析：ParseMultipartForm 会把超过 maxMemory 的部分落到临时文件，
+	// 3MB 的限额必须在读盘之前生效，否则一个 500MB 的 body 要先把磁盘填满才被拒。
+	// 留 64KiB 余量给 multipart 头与 boundary，超出的部分是畸形请求，不是音频。
+	r.Body = http.MaxBytesReader(w, r.Body, maxAudioBytes+audioBodySlack)
+	if err := r.ParseMultipartForm(maxAudioBytes); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "audio_too_large",
+				fmt.Sprintf("request body exceeds %d bytes; upstream accepts at most 3MB of audio", maxAudioBytes))
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 			"expected multipart/form-data with an audio file: "+err.Error())
 		return
 	}
+	// 超过内存上限的文件部分会被落到 /tmp，不删就每次超限上传漏 3MB 临时文件。
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
 	file, fh, err := audioPart(r)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
@@ -206,6 +238,24 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm := audioRealm(r.FormValue("realm"), r.FormValue("model"))
+	// OpenAI 的 response_format：json（默认）/ text 可选；srt/vtt/verbose_json 要时间戳，
+	// 上游不返回，明确拒掉而不是静默回 json。
+	format := strings.ToLower(strings.TrimSpace(r.FormValue("response_format")))
+	switch format {
+	case "", "json", "text":
+	default:
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("response_format %q 不支持：上游不返回时间戳，可选 json / text", r.FormValue("response_format")))
+		return
+	}
+
+	st := &chatStat{start: time.Now(), model: "asr", mode: "audio", toks: -1, budget: h.budget}
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+		st.requestID = tr.id
+		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+	}
+	defer st.done()
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -215,8 +265,15 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		tried[a.UID] = true
+		st.uid, st.nick, st.realm, st.attempts = a.UID, a.Nickname, realm, attempt+1
 		text, err := h.cfg.Upstream.Transcribe(r.Context(), a, fh.Filename, fh.Header.Get("Content-Type"), audio)
 		if err == nil {
+			st.status, st.outcome = http.StatusOK, reqlog.OutcomeSuccess
+			if format == "text" {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				_, _ = w.Write([]byte(text))
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]any{"text": text})
 			return
 		}
@@ -233,6 +290,7 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 					status = http.StatusBadRequest
 				}
 				log.Printf("transcriptions realm=%s: 请求级错误 kind=%v，不再换号", realm, ue.Kind)
+				st.status, st.outcome = status, reqlog.OutcomeHTTPError
 				writeOpenAIErrorHint(w, status, "upstream_error", ue.Msg,
 					upstream.GatewayHint(ue.Kind, ue.Msg, upstream.HintContext{}))
 				return
@@ -240,7 +298,7 @@ func (h *Handler) transcriptions(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("transcriptions %s realm=%s attempt=%d: %v", logfmt.Label(a.UID, a.Nickname), realm, attempt+1, err)
 	}
-	writeAudioFailure(w, "transcriptions", realm, tried, lastErr)
+	st.status, st.outcome = writeAudioFailure(w, "transcriptions", realm, tried, lastErr), reqlog.OutcomeHTTPError
 }
 
 // audioPart 取上传的音频：OpenAI 用 file，官方小程序/其它工具用 audio，两个都认。
@@ -259,8 +317,9 @@ func audioPart(r *http.Request) (multipart.File, *multipart.FileHeader, error) {
 	return nil, nil, errors.New("缺少音频文件：multipart 字段需为 file（OpenAI）或 audio")
 }
 
-// writeAudioFailure 两个端点共用末端映射（与 embeddings 同口径）。
-func writeAudioFailure(w http.ResponseWriter, name, realm string, tried map[string]bool, lastErr error) {
+// writeAudioFailure 两个端点共用末端映射（与 embeddings 同口径），返回写出的状态码
+// 供调用方记账。
+func writeAudioFailure(w http.ResponseWriter, name, realm string, tried map[string]bool, lastErr error) int {
 	status, code := http.StatusBadGateway, "upstream_error"
 	var ue *upstream.Error
 	switch {
@@ -277,4 +336,5 @@ func writeAudioFailure(w http.ResponseWriter, name, realm string, tried map[stri
 	}
 	log.Printf("%s realm=%s: 全部尝试失败（%d 个账号）：%v", name, realm, len(tried), lastErr)
 	writeOpenAIError(w, status, code, lastErr.Error())
+	return status
 }
