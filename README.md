@@ -60,6 +60,15 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
+## 合作伙伴
+
+<a href="https://www.ipwo.net/?ref=githubworkbuddy2apipanel"><img width="5120" height="601" alt="30f235b8d74c22bdf31db956230949a6" src="https://github.com/user-attachments/assets/e74e1c0a-d60f-46df-ae2f-84cbfb796db2" /></a>
+
+IPWO 住宅代理：为全球 API 连接提供灵活的网络支持。
+覆盖 195+ 个国家和地区的 9000 万+ 住宅 IP 资源，支持 HTTP(S)、SOCKS5 协议，以及国家和城市级定位。适用于 API 接入、跨境开发、网络连接测试及数据采集等场景。动态支持免费测试，静态IP低至9.9元/月/条。90折扣码：`0200`
+
+注册地址：https://www.ipwo.net/?ref=githubworkbuddy2apipanel
+
 ## 核心能力
 
 | 能力 | 说明 |
@@ -134,7 +143,7 @@ curl -s http://127.0.0.1:7863/v1/videos/1312831544-WandVideo-… \
   -H "Authorization: Bearer $WB2API_KEY"
 ```
 
-请求参数：`prompt`（必填）、`model`、`seconds`（实测 4-15）、`resolution`、`aspect_ratio`（`16:9` / `9:16` / `1:1`）、`negative_prompt`、`enable_audio`（默认 `true`）、`watermark`（默认 `true`）、`image`（图生视频，公网/签名 URL）、`last_image`（尾帧）、`wait`（缺省 `true`）、`timeout_seconds`（缺省 900，封顶 1800）。除 `wait` / `timeout_seconds` 外都原样交给上游。
+请求参数：`prompt`（必填）、`model`、`seconds`（实测 4-15）、`resolution`、`aspect_ratio`（`16:9` / `9:16` / `1:1`）、`negative_prompt`、`enable_audio`（默认 `true`）、`watermark`（默认 `true`）、`image`（图生视频，公网/签名 URL）、`last_image`（尾帧）、`reference_images` / `reference_videos` / `reference_audios`（参考素材，`["url", …]` 或上游原形 `[{"image_url": …}]` 都收，网关补成上游的对象数组）、`wait`（缺省 `true`）、`timeout_seconds`（缺省 900，封顶 1800）。除 `wait` / `timeout_seconds` 与三个 `reference_*` 的形状转换外，都原样交给上游。
 
 回执（出片后）：
 
