@@ -163,6 +163,37 @@ func TestVideoUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestVideoUpstreamReferenceMaterials 参考素材必须是对象数组（上游 []*v2.ReferenceImages）：
+// 字符串条目补成 {image_url|video_url|audio_url}，已是对象的取对应键或 url，
+// 转不出来的条目丢掉——但原始字段不能漏到尾部透传里。
+func TestVideoUpstreamReferenceMaterials(t *testing.T) {
+	var req map[string]any
+	body := `{"prompt":"x","reference_images":["https://a/1.png",{"image_url":"https://a/2.png"},""],
+	          "reference_videos":["https://a/1.mp4",{"url":"https://a/2.mp4"},{"audio_url":"错键"}],
+	          "reference_audios":"https://a/1.wav","seed":7}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("bad fixture: %v", err)
+	}
+	got, err := videoUpstreamBody(req, "m")
+	if err != nil {
+		t.Fatalf("videoUpstreamBody: %v", err)
+	}
+	imgs, _ := got["reference_images"].([]map[string]any)
+	if len(imgs) != 2 || imgs[0]["image_url"] != "https://a/1.png" || imgs[1]["image_url"] != "https://a/2.png" {
+		t.Fatalf("reference_images 应转成 2 条对象（空串丢掉）：%v", got["reference_images"])
+	}
+	vids, _ := got["reference_videos"].([]map[string]any)
+	if len(vids) != 2 || vids[1]["video_url"] != "https://a/2.mp4" {
+		t.Fatalf("video_url 认键失败或错键条目没丢：%v", got["reference_videos"])
+	}
+	if _, ok := got["reference_audios"]; ok {
+		t.Fatalf("非数组的 reference_audios 必须丢掉，不能原样透传：%v", got["reference_audios"])
+	}
+	if got["seed"] != float64(7) {
+		t.Fatalf("未知字段仍应透传：%v", got)
+	}
+}
+
 // TestVideosSubmitAsync 提交 + wait=false：一次上游调用、正确落点、正确 body，立刻回 task id。
 func TestVideosSubmitAsync(t *testing.T) {
 	f := &videoFake{on: func(c videoCall) (int, string) {
@@ -300,11 +331,15 @@ func TestVideosFailedTaskReturns502(t *testing.T) {
 	}
 }
 
-// TestVideosBadDurationFailsFast 上游 400（时长越界）是请求级错误：只打一次上游、
-// 原样回 400，不换号、不记账号惩罚。
+// TestVideosBadDurationFailsFast 提交阶段 4xx 是上游在建任务之前退回：任务没创建、
+// 积分没扣（实测 14407 时长越界）。池里必须有两个 cn 号才看得出「不换号」，
+// 而且两个号都不能被记连败——否则客户端连着写错参数就把健康号喂出池。
 func TestVideosBadDurationFailsFast(t *testing.T) {
 	f := &videoFake{on: func(c videoCall) (int, string) { return 400, videoBadDuration }}
-	p := imagePool()
+	p := testPoolWith(
+		&auth.Auth{UID: "c1", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+		&auth.Auth{UID: "c2", AccessToken: "at", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"},
+	)
 	h := NewHandler(Config{Pool: p, Upstream: f.client()})
 	rec := postVideo(t, h, `{"prompt":"x","seconds":1}`)
 	if rec.Code != 400 {
@@ -315,6 +350,16 @@ func TestVideosBadDurationFailsFast(t *testing.T) {
 	}
 	if n := f.count("/v2/videos/generations"); n != 1 {
 		t.Fatalf("请求级错误不该换号重试，实际打了 %d 次", n)
+	}
+	for _, uid := range []string{"c1", "c2"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("%s 不在池里", uid)
+		}
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 ||
+			st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+			t.Fatalf("%s 被处罚了：%+v", uid, st)
+		}
 	}
 }
 
