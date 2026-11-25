@@ -856,7 +856,38 @@ func (h *Handler) modelList() []map[string]any {
 	// 出图模型（目录里被 tag 剔掉的 text-to-image / image-to-image）：对话列表照旧不含它们，
 	// 这里以 image_generation=true 单列——客户端据此发现可用的出图模型名，不会误发对话。
 	out = append(out, h.generationModelEntries()...)
+	disambiguatePromoNames(out)
 	return out
+}
+
+// disambiguatePromoNames 给「同域内与兄弟模型重名」的优惠条目补上标签：
+// 上游 hy4-flash-free 与 hy4-flash 都叫「Hy4 flash」，而一个 0 分、一个 x0.03——
+// 只认 name 的客户端里这两行长一样，选了免费那行的可能实际发出付费 id（issue #286）。
+// 名字唯一的条目不碰（多数优惠模型如 glm-5.2 夜间折扣没有同名兄弟）；跨域同名也不碰，
+// id 前缀本来就不同。
+func disambiguatePromoNames(list []map[string]any) {
+	key := func(e map[string]any) string {
+		id, _ := e["id"].(string)
+		realm, name := id, ""
+		if i := strings.IndexByte(id, ':'); i >= 0 {
+			realm = id[:i]
+		}
+		name, _ = e["name"].(string)
+		return realm + "|" + name
+	}
+	count := map[string]int{}
+	for _, e := range list {
+		count[key(e)]++
+	}
+	for _, e := range list {
+		name, _ := e["name"].(string)
+		label, _ := e["promo_label"].(string)
+		if name == "" || label == "" || count[key(e)] < 2 {
+			continue
+		}
+		e["name"] = name + "（" + label + "）"
+		count[key(e)]-- // 同名同标签的兄弟只改一条，够区分即可
+	}
 }
 
 // generationModelEntries /v1/models 里的出图模型条目（来自最近一次目录解析的旁路留存，
@@ -2155,6 +2186,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					}
 					log.Printf("WARN: [starved] non-stream acct=%s model=%s: 关思考重发失败（status=%d err=%v）→ 保留原截断响应",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, st2, e2)
+				}
+			}
+		}
+		// 非流式路径不会经过 continueReader。浏览器完成控制标记如果被当成
+		// 普通正文返回，Codex 会把回合直接判完成；这里做同样的单次续写保护。
+		if marker := browserCompleteAggregateText(resp); marker != "" {
+			declared, toolTurn := bodyToolShape(body)
+			if declared || toolTurn {
+				if rb, ok := browserCompleteRetryBody(body, resp,
+					h.cfg.Upstream.OutputBudgetFloor(acct.Realm(), curModel, hopTiming.Effort)); ok {
+					if rc2, st2, _, e2 := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, rb, clientIP, chatMeta, nil); e2 == nil && st2 < 400 && rc2 != nil {
+						if resp2, e3 := upstream.Aggregate(rc2); e3 == nil {
+							rc2.Close()
+							u1, _ := resp["usage"].(map[string]any)
+							u2, _ := resp2["usage"].(map[string]any)
+							if u1 != nil || u2 != nil {
+								billUsage = sumUsage(sumUsage(nil, u1), u2)
+							}
+							resp = resp2
+							log.Printf("INFO: [browser-complete] non-stream acct=%s model=%s: 检测到独立浏览器完成控制标记 → 续写一次真正任务",
+								logfmt.Label(acct.UID, acct.Nickname), bareModel)
+						} else {
+							rc2.Close()
+							log.Printf("WARN: [browser-complete] non-stream acct=%s model=%s: 续写聚合失败: %v",
+								logfmt.Label(acct.UID, acct.Nickname), bareModel, e3)
+						}
+					} else if rc2 != nil {
+						rc2.Close()
+						log.Printf("WARN: [browser-complete] non-stream acct=%s model=%s: 续写请求失败（status=%d err=%v）→ 保留原始响应",
+							logfmt.Label(acct.UID, acct.Nickname), bareModel, st2, e2)
+					}
 				}
 			}
 		}
