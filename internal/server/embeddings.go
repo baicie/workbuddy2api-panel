@@ -221,11 +221,19 @@ func (h *Handler) embeddings(w http.ResponseWriter, r *http.Request) {
 			// 请求级错误（参数/内容/模型权限）：换号必然同样被拒，fail-fast 保住池子。
 			if requestLevelFailFastKind(ue.Kind) {
 				status := ue.Status
-				if status < 400 {
+				// 请求级错误的上游外壳可能是 5xx（11353 套 500、11148 套 5xx）：原样回 5xx
+				// 会诱导 OpenAI SDK 自动重试同一条坏 body，也让人误以为是服务故障。
+				if status < 400 || status >= 500 {
 					status = http.StatusBadRequest
 				}
-				log.Printf("embeddings realm=%s: 请求级错误 kind=%v，不再换号", realm, ue.Kind)
-				writeOpenAIError(w, status, "upstream_error", ue.Msg)
+				// 已定性成请求级，错误码就不该还叫 upstream_error（语义像 5xx，排查时看懵）；
+				// 11353 = 单条输入超 bge-m3 的 8192 token，是 embeddings 唯一的超限成因。
+				code := "upstream_error"
+				if ue.Code == 11353 {
+					code = "input_too_large"
+				}
+				log.Printf("embeddings realm=%s: 请求级错误 kind=%v code=%d，不再换号", realm, ue.Kind, ue.Code)
+				writeOpenAIError(w, status, code, ue.Msg)
 				return
 			}
 		}

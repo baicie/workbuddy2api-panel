@@ -106,7 +106,10 @@ func (k ErrKind) String() string {
 type Error struct {
 	Kind   ErrKind
 	Status int
-	Msg    string
+	// Code 上游业务信封里的 code（"code":11353 之类）。目前只有 embeddings 链路填 ——
+	// 面板日志要能分清「输入过大(11353)」和「坏音频(15053)」，而诊断只记码不记正文。
+	Code int
+	Msg  string
 	// RetryAfter 上游明示的等待时长（Retry-After 秒 / retry-after-ms /
 	// x-ratelimit-reset 头解析，见 ParseRetryAfter）。零值 = 上游未明示，
 	// 冷却时长回落调用方计算值。挂载点选在 Error 信封：Kind 决定「罚不罚」，
@@ -826,6 +829,14 @@ func Classify(status int, body string) ErrKind {
 	// （2026-11-20 实测：裸 PCM 不带容器头必现）。同一个文件换号也是同一句，归请求级；
 	// 落 ErrServer 会为一段坏音频轮转全池并给健康号各记一笔连败。
 	if codeMarker(lower, "15053") {
+		return ErrBadParams
+	}
+	// 11353「TEI 嵌入后端 413（输入过大）」：上游把它套在 HTTP 500 外壳里当服务端错误。
+	// 触发条件由**请求内容**决定（同一 body 换任何账号都是同一句），归请求级；落
+	// ErrServer 会为一条超大 input 轮转全池并给健康号各记一笔连败 —— issue #290 实测
+	// 15 个坏请求熔断 11 个号 30 分钟。只认带 [413] 的形态：不带 413 的 11353 是 TEI
+	// 自身故障，仍按 5xx 处理（换号也是同一堵墙，但至少别把它当成请求的问题）。
+	if codeMarker(lower, "11353") && strings.Contains(lower, "[413]") {
 		return ErrBadParams
 	}
 	if status == http.StatusNotFound {
