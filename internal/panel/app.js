@@ -602,7 +602,11 @@ function renderAccounts(list) {
     else if (s.paused) { cls = 'off'; tag = '<span class="tag warn">已暂停选号</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+      // 标签按服务端给的 cool_kind 判，不比较秒数：cool_remaining_sec 是服务端
+      // 向上取整的整秒，bl 是前端后算的浮点秒，只差几十毫秒 ⇒ bl > cool_remaining_sec
+      // 恒为 false，于是「只有熔断」永远显示成「限流冷却」（issue #290）。
+      // state.go 已经算出谁截止更晚并写进 cool_kind，前端直接照抄即可。
+      const kind = s.cool_kind === 'breaker' ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     }
@@ -5214,10 +5218,14 @@ function renderDailyBars(series) {
       const x = gx + (groupW - (bw * nAcc + gap * (nAcc - 1))) / 2 + si * (bw + gap);
       const y0 = Math.min(zeroY, Y(v)), h = Math.max(1, Math.abs(Y(v) - zeroY));
       const incomplete = fullMap.get(s.uid + '|' + day);
+      // <title> 必须挂在柱子自己身上：作为 <svg> 根的直接子节点时浏览器把它当整图
+      // 说明，于是**所有柱子共用第一条**（issue #289；token 图同理，见 renderUsageChart）。
+      const tip = '<title>' + esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(day) + '\n' +
+        (v > 0 ? '+' : '') + fmtNum(v) + (incomplete ? '\n⚠️ 该日采样不完整（当天未结束或中途启用）' : '') + '</title>';
       // 零值画一条中性底痕（与 buka 规范一致：0 值也要可见）
       if (v === 0) {
         out += '<rect x="' + x.toFixed(1) + '" y="' + (zeroY - 1).toFixed(1) + '" width="' + bw.toFixed(1) +
-          '" height="2" fill="var(--line)" rx="1"/>';
+          '" height="2" fill="var(--line)" rx="1">' + tip + '</rect>';
       } else {
         // 离群点（超出裁剪后的轴范围）：柱子贴边 + 顶部三角标记，
         // 让读者一眼看出「这根比轴还高」，而不是误以为它只有这么高。
@@ -5225,7 +5233,7 @@ function renderDailyBars(series) {
         out += '<rect x="' + x.toFixed(1) + '" y="' + y0.toFixed(1) + '" width="' + bw.toFixed(1) +
           '" height="' + h.toFixed(1) + '" fill="' + (v > 0 ? 'var(--ok)' : 'var(--bad)') + '"' +
           (incomplete ? ' opacity=".38" stroke="' + color + '" stroke-width="1" stroke-dasharray="2 2"' : '') +
-          ' rx="1.5"/>';
+          ' rx="1.5">' + tip + '</rect>';
         if (clippedHi || clippedLo) {
           const ty = clippedHi ? PT : PT + ih;
           out += '<path d="M' + (x + bw / 2).toFixed(1) + ' ' + (clippedHi ? ty : ty - 5).toFixed(1) +
@@ -5233,8 +5241,6 @@ function renderDailyBars(series) {
             '<title>超出纵轴范围（已裁剪），实际 ' + (v > 0 ? '+' : '') + fmtNum(v) + '</title></path>';
         }
       }
-      out += '<title>' + esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(day) + '\n' +
-        (v > 0 ? '+' : '') + fmtNum(v) + (incomplete ? '\n⚠️ 该日采样不完整（当天未结束或中途启用）' : '') + '</title>';
     });
     // x 轴日期标签（稀疏）
     // 与上方「积分水位」图同一口径（天数 / 3 + 1，夹在 2~10 之间），保证可纵向对照。
