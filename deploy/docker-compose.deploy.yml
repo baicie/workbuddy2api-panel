@@ -26,6 +26,10 @@ services:
       # 只绑回环：对外统一走前置 Caddy（panel.moonbyte.top / panel-global.moonbyte.top），
       # 明文端口不再直接暴露公网。需要临时直连调试时改回 "${HOST_PORT:-7863}:7863"。
       - "127.0.0.1:${HOST_PORT:-7863}:7863"
+      # 同机的 new-api 在容器里，只能经 docker 网关 IP 访问宿主机端口；
+      # 只绑回环会让它连不上（20261127 现场：面板滚版本后 channel#1 全线 500
+      # do_request_failed，12ms 直接拒连）。这条只落在 bridge 网关上，不进公网。
+      - "172.20.0.1:${HOST_PORT:-7863}:7863"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
