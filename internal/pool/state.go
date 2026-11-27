@@ -915,6 +915,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:             int(e.inFlight.Load()),
 		BreakerFails:         e.fails,
 		BreakerUntil:         e.breakerUntil,
+		// 认证故障与禁用成因必须透出：面板据此区分「需要重新授权」与「管理员禁用」，
+		// 并决定要不要给重登录入口。-X theirs 合并曾把这三行整段丢掉，
+		// 表现为 auth_fault 恒为空、needs_relogin 永远 false。
+		AuthFault:     string(e.authFault),
+		AuthFaultAt:   e.authFaultAt,
+		DisabledCause: string(e.disabledCause),
 	}
 	// 「需要重新登录」= 因认证失效而被禁用。放在字面量之后而不是中间：在字面量里插一行
 	// 独立注释会打断 gofmt 的对齐组，把后面十几个字段的对齐整体改一遍，diff 噪声远大于
