@@ -851,6 +851,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		ReserveBlocked:           p.reserveBlocked(e, false),
+		FloorBlocked:             p.creditFloor > 0 && e.exactCredits() < float64(p.creditFloor),
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
 		Enterprise:               e.a.IsEnterprise(),

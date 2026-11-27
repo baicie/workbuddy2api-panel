@@ -637,6 +637,14 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     }
     else if (s.reserve_blocked) { cls = 'cool'; tag = '<span class="tag warn">保留积分</span>'; }
+    // 低于积分保底（credits < credit_floor）：号仍在池、照常签到保活，只是收费模型
+    // 不出票。此前这层排除完全不透出，面板打「可用」而请求选不到号（现场：12 号在池、
+    // 实际只有 1 号出票）。判据由服务端给（floor_blocked），前端不自己比 credits。
+    else if (s.floor_blocked) {
+      cls = 'cool';
+      const have = s.credits_raw != null ? s.credits_raw : s.credits;
+      tag = '<span class="tag warn" title="积分 ' + have + ' 低于保底，收费模型不出票；签到回血后自动恢复">积分不足 · 待签到</span>';
+    }
     // 会话疑似失效（12153 连续计数已 >0、还没到禁用阈值）：上游已判死、号还留在池里。
     // 此前这种中间态完全不可见，面板照样打「可用」（issue #215 复盘）。
     else if (s.session_dead_fails > 0) { cls = 'cool'; tag = '<span class="tag warn">疑似登录失效 · 待重登</span>'; }

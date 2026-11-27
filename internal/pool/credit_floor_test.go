@@ -426,3 +426,27 @@ func TestCreditFloorFallbackAllowsFreeModel(t *testing.T) {
 		t.Fatal("兜底路径对免费模型应放行触底号，got nil")
 	}
 }
+
+// TestStatusReportsFloorBlocked 面板要能看出「号在池里但积分不够」：
+// Status.FloorBlocked 与选号侧的拦截判据同源（credits < floor），
+// 否则运维只会看到「可用」，而请求始终选不到它。
+func TestStatusReportsFloorBlocked(t *testing.T) {
+	p := New("")
+	p.SetCreditFloor(100)
+	p.Add(&auth.Auth{UID: "poor"})
+	p.Add(&auth.Auth{UID: "rich"})
+	p.SetCredits("poor", 30, 0)
+	p.SetCredits("rich", 500, 0)
+
+	st, ok := p.Status("poor")
+	if !ok {
+		t.Fatal("Status(poor) 不存在")
+	}
+	if !st.FloorBlocked {
+		t.Errorf("poor credits=30 < floor=100，FloorBlocked 应为 true")
+	}
+	stRich, _ := p.Status("rich")
+	if stRich.FloorBlocked {
+		t.Errorf("rich credits=500 >= floor=100，FloorBlocked 应为 false")
+	}
+}
