@@ -108,6 +108,10 @@ type Config struct {
 	// （features.busy_retry，默认开）。见 chatCompletions 的 ErrUpstreamBusy 分支。
 	BusyRetry bool
 
+	// SystemTail 把开头 system 挪到消息末尾、头部留固定桩（features.system_tail，
+	// 默认关，仅 cn 域生效）。见 prompt.SystemToTail 的实测数据与代价。
+	SystemTail bool
+
 	// BusyWaitMax 单次排队等待上限（features.busy_wait_seconds，默认 60s）。
 	// <=0 = 不等，直接把排队交给客户端按 Retry-After 退避。
 	BusyWaitMax time.Duration
@@ -1445,6 +1449,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 兜一次。只补首条缺失这一种情况，其余消息逐字不动。
 	body = prompt.EnsureSystemFirst(body, h.cfg.PromptText)
 
+	// system 后置（features.system_tail，仅 cn 域）：客户端每轮都改 system 时，system 留在
+	// 头部会让前缀从第 0 个 token 就分叉，长历史全量重算（issue #293 的 5%）。
+	// 位置必须在 EnsureSystemFirst 之后——那一步要求 messages[0] 是 system，挪走就没桩了。
+	// shortcut: 续写段（continueReader 用入站 r.body 重组）不走这里，会退回 system 在头部，
+	// 也就是续写那次不吃缓存；要一致就得挪到 upstream.prepareBodyOpt，等他日再改。
+	if h.cfg.SystemTail && realm == "cn" {
+		body, _ = prompt.SystemToTail(body)
+	}
+
 	// outbound model 名由 upstream.prepareBody 在同一次 JSON 解析里剥成裸名
 	// （realm 前缀是网关侧路由协议，上游不认前缀）。这里不再提前做整段
 	// parse+marshal，body 保留客户端原始模型名供日志/续写帧使用。
@@ -2074,6 +2087,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 单独一行，排障时能一眼区分「没识别到」与「识别到但拒绝」。
 				log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, m, len(declaredTools))
+			} else if n := repair.Orphan(); n > 0 {
+				// 正文里有 invoke 头却没有外层 calls 包裹：DeepSeek 系在长上下文下会漏写包裹，
+				// 本仓库的修复器以包裹为锚，这种形态一律透出成正文（客户端不会执行）。
+				// 只报不转：发生率没量到之前，加转换分支是纯风险。见到这条就说明该修了。
+				log.Printf("WARN: [server] stream acct=%s model=%s: 透出 %d 处缺 calls 包裹的 invoke 块（工具调用漏成正文）",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, n)
 			}
 			// issue #44：声明了 tools 却拿到 finish_reason=stop 且全流零 tool_calls ——
 			// 上游把这个形态当正常收尾，客户端据此认为回合完成、工具一次没跑，用户
@@ -2088,8 +2107,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.toolCalls = 1
 			}
 			if len(declaredTools) > 0 && !stats.SawToolCalls() && stats.FinishReason() == "stop" {
-				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (本轮无工具调用，正常收尾)",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools))
+				// 带上用量：tok≈think 时正文几乎是空的（模型想完就收，客户端看到「说到一半」），
+				// tok 远大于 think 才是真的答完了。没有这两个数，事后无法区分这两类收尾。
+				ct, hasCT := stats.Tokens()
+				th, hasTh := stats.Thinking()
+				log.Printf("INFO: [server] stream acct=%s model=%s: finish_reason=stop with zero tool_calls despite %d declared tool(s) (tok=%d think=%d hasTok=%v hasThink=%v 本轮无工具调用，正常收尾)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, len(declaredTools), ct, th, hasCT, hasTh)
 			}
 			// 正文截断留痕：finish_reason=length 表示上游在输出额度处切断了这一轮。
 			// 此前 reqlog 不记 finish_reason、日志也没有任何 length 行，「回答写到一半
